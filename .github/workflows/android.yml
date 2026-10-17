@@ -2,11 +2,6 @@ name: BlackOps1 XenonRecomp Bootstrap
 
 on:
   workflow_dispatch:
-    paths:
-      - 'build.sh'
-      - 'config/**'
-      - 'docs/**'
-      - '.github/workflows/android.yml'
 
 permissions:
   contents: read
@@ -15,6 +10,7 @@ jobs:
   validate-bootstrap:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,13 +25,36 @@ jobs:
           bash -n build.sh
           shellcheck build.sh
 
-      - name: Validate initial project files
+      - name: Diagnose initial project files
+        shell: bash
         run: |
-          set -euo pipefail
-          test -f README.md
-          test -f docs/PORTING_AUDIT.md
-          test -f config/BO1.toml.template
-          test -f build.sh
-          test -f .github/workflows/android.yml
-          echo "Bootstrap files are present and shell syntax is valid."
-          echo "This workflow does NOT build an APK. BO1-specific XenonRecomp config/runtime are not implemented yet."
+          set -uo pipefail
+
+          missing=0
+
+          for file in \
+            README.md \
+            docs/PORTING_AUDIT.md \
+            config/BO1.toml.template \
+            build.sh \
+            .github/workflows/android.yml
+          do
+            if [ -f "$file" ]; then
+              echo "OK: $file"
+            else
+              echo "MISSING: $file"
+              missing=1
+            fi
+          done
+
+          echo
+          echo "Current branch: $GITHUB_REF_NAME"
+          echo "Repository: $GITHUB_REPOSITORY"
+
+          if [ "$missing" -ne 0 ]; then
+            echo "ERROR: One or more required files are missing or misnamed."
+            exit 1
+          fi
+
+          echo "All bootstrap files are present."
+          echo "This workflow validates the bootstrap only; it does not build an APK."
