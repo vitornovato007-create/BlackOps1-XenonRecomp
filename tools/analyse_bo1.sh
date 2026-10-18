@@ -146,3 +146,5 @@ fi
 
 echo "==> Análise concluída"
 echo "A saída ainda precisa ser validada para o Black Ops 1."
+
+bash "$ROOT/tools/recomp_bo1.sh"
