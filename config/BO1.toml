@@ -1,1 +1,26 @@
+[main]
+file_path = "../game/default.xex"
+out_directory_path = "../generated/ppc"
+switch_table_file_path = "../generated/BO1_switch_tables.toml"
 
+# Otimizacoes: so ligar depois de ter uma recompilacao funcionando.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Funcoes auxiliares de salvar/restaurar registradores (achadas no BO1).
+restgprlr_14_address = 0x825F85F0
+savegprlr_14_address = 0x825F85A0
+restfpr_14_address = 0x825F869C
+savefpr_14_address = 0x825F8650
+restvmx_14_address = 0x825FAB18
+savevmx_14_address = 0x825FA880
+restvmx_64_address = 0x825FABAC
+savevmx_64_address = 0x825FA914
+
+# setjmp_address e longjmp_address: ainda nao localizados no BO1.
