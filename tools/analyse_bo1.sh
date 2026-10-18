@@ -23,8 +23,7 @@ echo "==> Preparando XenonRecomp oficial"
 if [[ -d "$ROOT/XenonRecomp/.git" ]]; then
     git -C "$ROOT/XenonRecomp" submodule update --init --recursive
 elif [[ -e "$ROOT/XenonRecomp" ]]; then
-    echo "::error::A pasta XenonRecomp existe, mas não é um checkout Git válido."
-    echo "Verifique a pasta antes de tentar novamente."
+    echo "::error::XenonRecomp existe, mas não é um checkout Git válido."
     exit 3
 else
     git clone --recurse-submodules \
@@ -32,7 +31,7 @@ else
         "$ROOT/XenonRecomp"
 fi
 
-echo "==> Configurando as ferramentas oficiais"
+echo "==> Configurando XenonRecomp"
 
 cmake \
     -S "$ROOT/XenonRecomp" \
@@ -42,13 +41,15 @@ cmake \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++
 
-echo "==> Compilando XenonAnalyse e XenonRecomp"
+echo "==> Compilando ferramentas oficiais"
 
 cmake --build "$ROOT/build/xenonrecomp" --parallel 2
 
-ANALYSER="$ROOT/build/xenonrecomp/XenonAnalyse"
+echo "==> Localizando XenonAnalyse"
 
-if [[ ! -x "$ANALYSER" ]]; then
+ANALYSER="$ROOT/build/xenonrecomp/XenonAnalyse/XenonAnalyse"
+
+if [[ ! -f "$ANALYSER" || ! -x "$ANALYSER" ]]; then
     ANALYSER="$(
         find "$ROOT/build/xenonrecomp" \
             -type f \
@@ -58,23 +59,28 @@ if [[ ! -x "$ANALYSER" ]]; then
     )"
 fi
 
-if [[ -z "$ANALYSER" || ! -x "$ANALYSER" ]]; then
-    echo "::error::XenonAnalyse não foi encontrado após a compilação."
+if [[ -z "$ANALYSER" || ! -f "$ANALYSER" || ! -x "$ANALYSER" ]]; then
+    echo "::error::Executável XenonAnalyse não encontrado."
+    echo "Conteúdo da pasta de compilação:"
+    find "$ROOT/build/xenonrecomp" -maxdepth 4 -name '*XenonAnalyse*' -print
     exit 4
 fi
 
+echo "Analisador encontrado: $ANALYSER"
+
 mkdir -p "$(dirname "$OUTPUT")"
 
-echo "==> Analisando o executável do BO1"
+echo "==> Analisando o executável BO1"
 
 "$ANALYSER" "$XEX" "$OUTPUT"
 
 if [[ ! -s "$OUTPUT" ]]; then
-    echo "::error::A análise não produziu um arquivo TOML não vazio."
-    echo "Pode ser necessário adaptar o analisador ao formato do BO1."
+    echo "::error::O analisador não produziu um arquivo de saída válido."
+    echo "Verifique a mensagem de uso do XenonAnalyse e o formato de entrada."
     exit 5
 fi
 
 echo "==> Análise concluída"
 echo "Arquivo gerado: $OUTPUT"
-echo "A tabela ainda precisa ser validada para o BO1."
+ls -lh "$OUTPUT"
+echo "A saída ainda precisa ser validada para o Black Ops 1."
