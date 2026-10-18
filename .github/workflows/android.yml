@@ -1,4 +1,4 @@
-name: BlackOps1 XenonRecomp Bootstrap
+name: BlackOps1 XenonRecomp Android Pipeline
 
 on:
   workflow_dispatch:
@@ -7,54 +7,67 @@ permissions:
   contents: read
 
 jobs:
-  validate-bootstrap:
+  analyse-bo1:
+    name: Build tools and analyse BO1
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install basic validation tools
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck python3
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            clang \
+            git \
+            shellcheck \
+            python3
 
-      - name: Validate shell script
+      - name: Show compiler versions
+        run: |
+          cmake --version
+          ninja --version
+          clang --version
+          clang++ --version
+          git --version
+
+      - name: Validate shell scripts
         run: |
           bash -n build.sh
-          shellcheck build.sh
+          bash -n tools/analyse_bo1.sh
+          shellcheck build.sh tools/analyse_bo1.sh
 
-      - name: Diagnose initial project files
-        shell: bash
+      - name: Verify BO1 input
         run: |
-          set -uo pipefail
-
-          missing=0
-
-          for file in \
-            README.md \
-            docs/PORTING_AUDIT.md \
-            config/BO1.toml.template \
-            build.sh \
-            .github/workflows/android.yml
-          do
-            if [ -f "$file" ]; then
-              echo "OK: $file"
-            else
-              echo "MISSING: $file"
-              missing=1
-            fi
-          done
-
-          echo
-          echo "Current branch: $GITHUB_REF_NAME"
-          echo "Repository: $GITHUB_REPOSITORY"
-
-          if [ "$missing" -ne 0 ]; then
-            echo "ERROR: One or more required files are missing or misnamed."
+          if [ ! -s game/default.xex ]; then
+            echo "::error::game/default.xex está ausente ou vazio."
             exit 1
           fi
 
-          echo "All bootstrap files are present."
-          echo "This workflow validates the bootstrap only; it does not build an APK."
+          echo "Entrada encontrada."
+          ls -lh game/default.xex
+
+      - name: Build XenonRecomp and analyse BO1
+        run: |
+          chmod +x build.sh tools/analyse_bo1.sh
+          ./build.sh game/default.xex
+
+      - name: Verify generated analysis
+        run: |
+          test -s generated/BO1_switch_tables.toml
+          echo "Tabela gerada:"
+          ls -lh generated/BO1_switch_tables.toml
+          echo
+          cat generated/BO1_switch_tables.toml
+
+      - name: Upload BO1 analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bo1-switch-tables
+          path: generated/BO1_switch_tables.toml
+          if-no-files-found: error
+          retention-days: 14
