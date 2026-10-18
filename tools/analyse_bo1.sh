@@ -35,16 +35,32 @@ echo "==> Instalando o main.cpp ajustado do XenonAnalyse (BO1)"
 
 MAIN_CPP="$ROOT/XenonRecomp/XenonAnalyse/main.cpp"
 SRC_MAIN="$ROOT/tools/xenon_analyse_main.cpp"
+SRC_HELPERS="$ROOT/tools/bo1_helpers.h"
 
 if [[ ! -f "$SRC_MAIN" ]]; then
     echo "::error::tools/xenon_analyse_main.cpp não encontrado."
     exit 7
 fi
 
+if [[ ! -f "$SRC_HELPERS" ]]; then
+    echo "::error::tools/bo1_helpers.h não encontrado."
+    exit 7
+fi
+
 cp "$SRC_MAIN" "$MAIN_CPP"
+cp "$SRC_HELPERS" "$ROOT/XenonRecomp/XenonAnalyse/bo1_helpers.h"
 
 if ! grep -q 'BO1_PATCHED_MAIN' "$MAIN_CPP"; then
     echo "::error::Não consegui instalar o main.cpp ajustado."
+    exit 7
+fi
+
+sed -i 's|#include "function.h"|#include "function.h"\n#include "bo1_helpers.h"|' "$MAIN_CPP"
+sed -i 's|^\(\s*\)auto image = Image::ParseImage(file.data(), file.size());|&\n\1BO1FindHelpers(image);|' "$MAIN_CPP"
+
+if ! grep -q 'bo1_helpers.h' "$MAIN_CPP" || ! grep -q 'BO1FindHelpers(image);' "$MAIN_CPP"; then
+    echo "::error::Não consegui inserir a busca de funções auxiliares no main.cpp."
+    grep -n 'include\|ParseImage' "$MAIN_CPP" || true
     exit 7
 fi
 
@@ -99,6 +115,10 @@ echo "==> Analisando o executável BO1"
 
 "$ANALYSER" "$XEX" "$OUTPUT" 2>&1 | tee "$LOG"
 
+echo
+echo "==== INICIO HELPERS ===="
+grep '^\[helpers\]' "$LOG" || echo "(nenhuma linha de helpers)"
+echo "==== FIM HELPERS ===="
 echo
 echo "==== INICIO PROBE ===="
 grep '^\[probe\]' "$LOG" || echo "(nenhuma linha de probe)"
