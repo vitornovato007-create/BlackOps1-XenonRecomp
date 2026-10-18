@@ -68,19 +68,38 @@ fi
 
 echo "Analisador encontrado: $ANALYSER"
 
+echo "==> Diagnóstico do XEX"
+echo "Arquivo: $XEX"
+echo "Tamanho em bytes: $(stat -c %s "$XEX")"
+echo "Primeiros 16 bytes (hex):"
+od -An -tx1 -N16 "$XEX"
+echo "(um XEX2 válido começa com: 58 45 58 32)"
+
 mkdir -p "$(dirname "$OUTPUT")"
+LOG="$ROOT/generated/xenonanalyse.log"
 
 echo "==> Analisando o executável BO1"
 
-"$ANALYSER" "$XEX" "$OUTPUT"
+"$ANALYSER" "$XEX" "$OUTPUT" 2>&1 | tee "$LOG"
 
 if [[ ! -s "$OUTPUT" ]]; then
-    echo "::error::O analisador não produziu um arquivo de saída válido."
-    echo "Verifique a mensagem de uso do XenonAnalyse e o formato de entrada."
+    echo "::error::O analisador não produziu um arquivo de saída."
     exit 5
 fi
 
-echo "==> Análise concluída"
+BLOCKS="$(grep -c '^\[\[' "$OUTPUT" || true)"
+
+echo "==> Resultado da análise"
 echo "Arquivo gerado: $OUTPUT"
 ls -lh "$OUTPUT"
+echo "Linhas no arquivo: $(wc -l < "$OUTPUT")"
+echo "Blocos de jump table encontrados: $BLOCKS"
+
+if [[ "$BLOCKS" -eq 0 ]]; then
+    echo "::error::O TOML não contém nenhuma jump table. A análise não achou nada."
+    echo "Veja o diagnóstico do XEX e a saída do XenonAnalyse acima."
+    exit 6
+fi
+
+echo "==> Análise concluída"
 echo "A saída ainda precisa ser validada para o Black Ops 1."
