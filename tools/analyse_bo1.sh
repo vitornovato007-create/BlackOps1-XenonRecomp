@@ -7,61 +7,74 @@ cd "$ROOT"
 XEX="${1:-$ROOT/game/default.xex}"
 OUTPUT="${2:-$ROOT/generated/BO1_switch_tables.toml}"
 
+if [[ "$XEX" != /* ]]; then
+    XEX="$ROOT/$XEX"
+fi
+
 if [[ ! -f "$XEX" ]]; then
     echo "::error::Executável BO1 não encontrado: $XEX"
     exit 2
 fi
 
-mkdir -p generated build
+mkdir -p "$ROOT/generated" "$ROOT/build"
 
-if [[ ! -d XenonRecomp/.git ]]; then
-    rm -rf XenonRecomp
-    git clone --recursive \
-        https://github.com/hedge-dev/XenonRecomp.git \
-        XenonRecomp
+echo "==> Preparando XenonRecomp oficial"
+
+if [[ -d "$ROOT/XenonRecomp/.git" ]]; then
+    git -C "$ROOT/XenonRecomp" submodule update --init --recursive
+elif [[ -e "$ROOT/XenonRecomp" ]]; then
+    echo "::error::A pasta XenonRecomp existe, mas não é um checkout Git válido."
+    echo "Verifique a pasta antes de tentar novamente."
+    exit 3
 else
-    git -C XenonRecomp submodule update --init --recursive
+    git clone --recurse-submodules \
+        https://github.com/hedge-dev/XenonRecomp.git \
+        "$ROOT/XenonRecomp"
 fi
 
-cmake -S XenonRecomp -B build/xenonrecomp \
+echo "==> Configurando as ferramentas oficiais"
+
+cmake \
+    -S "$ROOT/XenonRecomp" \
+    -B "$ROOT/build/xenonrecomp" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++
 
-cmake --build build/xenonrecomp --parallel 2
+echo "==> Compilando XenonAnalyse e XenonRecomp"
 
-ANALYSER=""
+cmake --build "$ROOT/build/xenonrecomp" --parallel 2
 
-for candidate in \
-    build/xenonrecomp/XenonAnalyse \
-    build/xenonrecomp/XenonAnalyse/XenonAnalyse
-do
-    if [[ -x "$candidate" ]]; then
-        ANALYSER="$candidate"
-        break
-    fi
-done
+ANALYSER="$ROOT/build/xenonrecomp/XenonAnalyse"
 
-if [[ -z "$ANALYSER" ]]; then
-    ANALYSER="$(find build/xenonrecomp -type f \
-        -name XenonAnalyse -perm -111 -print -quit)"
+if [[ ! -x "$ANALYSER" ]]; then
+    ANALYSER="$(
+        find "$ROOT/build/xenonrecomp" \
+            -type f \
+            -name XenonAnalyse \
+            -perm -111 \
+            -print -quit
+    )"
 fi
 
-if [[ -z "$ANALYSER" ]]; then
-    echo "::error::A compilação terminou, mas XenonAnalyse não foi localizado."
-    echo "Confira os alvos e os caminhos de saída do CMake upstream."
+if [[ -z "$ANALYSER" || ! -x "$ANALYSER" ]]; then
+    echo "::error::XenonAnalyse não foi encontrado após a compilação."
     exit 4
 fi
 
 mkdir -p "$(dirname "$OUTPUT")"
 
+echo "==> Analisando o executável do BO1"
+
 "$ANALYSER" "$XEX" "$OUTPUT"
 
 if [[ ! -s "$OUTPUT" ]]; then
-    echo "::error::O analisador não produziu a tabela de saltos."
+    echo "::error::A análise não produziu um arquivo TOML não vazio."
+    echo "Pode ser necessário adaptar o analisador ao formato do BO1."
     exit 5
 fi
 
-echo "Análise concluída: $OUTPUT"
-echo "A tabela gerada precisa ser revisada antes da recompilação completa."
+echo "==> Análise concluída"
+echo "Arquivo gerado: $OUTPUT"
+echo "A tabela ainda precisa ser validada para o BO1."
