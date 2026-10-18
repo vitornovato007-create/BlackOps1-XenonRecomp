@@ -1,53 +1,55 @@
+
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-echo "BlackOps1-XenonRecomp: bootstrap validation"
-echo "This script deliberately does not reuse MW2's executable addresses or generated PPC code."
+XEX="${BO1_XEX:-${1:-$ROOT/game/default.xex}}"
 
-XEX="${BO1_XEX:-${1:-}}"
-if [[ -z "$XEX" ]]; then
-  for candidate in game/default.xex private-input/default.xex; do
-    if [[ -f "$candidate" ]]; then XEX="$candidate"; break; fi
-  done
+if [[ "$XEX" != /* ]]; then
+    XEX="$ROOT/$XEX"
 fi
 
-if [[ -z "$XEX" || ! -f "$XEX" ]]; then
-  cat >&2 <<'EOF'
-ERROR: Black Ops 1 default.xex was not provided.
-
-For local testing, set BO1_XEX=/path/to/your/legally-obtained/default.xex
-or place it at game/default.xex (do not commit it).
-
-The workflow must pass the executable privately. This bootstrap does not
-download copyrighted game files.
-EOF
-  exit 2
+if [[ ! -f "$XEX" ]]; then
+    echo "::error::Executável BO1 não encontrado: $XEX"
+    echo "Coloque o default.xex em game/default.xex."
+    exit 2
 fi
 
-if [[ ! -f config/BO1.toml ]]; then
-  cat >&2 <<'EOF'
-ERROR: config/BO1.toml is not ready.
+for tool in cmake ninja git clang clang++; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "::error::Ferramenta necessária não encontrada: $tool"
+        exit 3
+    fi
+done
 
-The MW2 config contains MW2-specific function addresses and jump-table data.
-Those values cannot be safely renamed or copied for Black Ops 1. A BO1 config
-must be derived from the exact executable and validated with XenonAnalyse.
+echo "=========================================="
+echo " BlackOps1-XenonRecomp"
+echo " Etapa: análise real do executável"
+echo "=========================================="
 
-No recompilation was attempted.
-EOF
-  exit 3
+cmake \
+    -S "$ROOT" \
+    -B "$ROOT/build" \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBO1_XEX="$XEX"
+
+cmake --build "$ROOT/build" \
+    --target bo1_analyse \
+    --parallel 2
+
+OUTPUT="$ROOT/generated/BO1_switch_tables.toml"
+
+if [[ ! -s "$OUTPUT" ]]; then
+    echo "::error::A tabela de análise não foi gerada."
+    exit 4
 fi
 
-if [[ ! -d XenonRecomp ]]; then
-  cat >&2 <<'EOF'
-ERROR: XenonRecomp source checkout is missing.
-A pinned, reviewed XenonRecomp revision and BO1-specific patch set must be
-added before this build can proceed.
-EOF
-  exit 4
-fi
-
-echo "Input and config files exist, but this bootstrap does not yet guarantee compatibility."
-echo "STOP: implement and validate BO1-specific analysis/recompilation before building an APK."
-exit 5
+echo
+echo "SUCESSO: o estágio de análise terminou."
+echo "Tabela: $OUTPUT"
+echo
+echo "ATENÇÃO: a recompilação completa do BO1 ainda não foi executada."
+echo "A próxima etapa exige uma configuração BO1 validada."
