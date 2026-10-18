@@ -31,26 +31,20 @@ else
         "$ROOT/XenonRecomp"
 fi
 
-echo "==> Instalando a sonda de diagnóstico no XenonAnalyse"
+echo "==> Instalando o main.cpp ajustado do XenonAnalyse (BO1)"
 
 MAIN_CPP="$ROOT/XenonRecomp/XenonAnalyse/main.cpp"
+SRC_MAIN="$ROOT/tools/xenon_analyse_main.cpp"
 
-if [[ ! -f "$ROOT/tools/bo1_probe.h" ]]; then
-    echo "::error::tools/bo1_probe.h não encontrado."
+if [[ ! -f "$SRC_MAIN" ]]; then
+    echo "::error::tools/xenon_analyse_main.cpp não encontrado."
     exit 7
 fi
 
-cp "$ROOT/tools/bo1_probe.h" "$ROOT/XenonRecomp/XenonAnalyse/bo1_probe.h"
+cp "$SRC_MAIN" "$MAIN_CPP"
 
-if ! grep -q 'bo1_probe.h' "$MAIN_CPP"; then
-    sed -i 's|#include "function.h"|#include "function.h"\n#include "bo1_probe.h"|' "$MAIN_CPP"
-    sed -i 's|^\(\s*\)auto image = Image::ParseImage(file.data(), file.size());|&\n\1BO1Probe(image);|' "$MAIN_CPP"
-fi
-
-if ! grep -q 'bo1_probe.h' "$MAIN_CPP" || ! grep -q 'BO1Probe(image);' "$MAIN_CPP"; then
-    echo "::error::Não consegui inserir a sonda no main.cpp do XenonAnalyse."
-    echo "O arquivo oficial pode ter mudado. Trecho relevante:"
-    grep -n 'include\|ParseImage' "$MAIN_CPP" || true
+if ! grep -q 'BO1_PATCHED_MAIN' "$MAIN_CPP"; then
+    echo "::error::Não consegui instalar o main.cpp ajustado."
     exit 7
 fi
 
