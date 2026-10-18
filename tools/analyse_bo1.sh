@@ -31,6 +31,29 @@ else
         "$ROOT/XenonRecomp"
 fi
 
+echo "==> Instalando a sonda de diagnóstico no XenonAnalyse"
+
+MAIN_CPP="$ROOT/XenonRecomp/XenonAnalyse/main.cpp"
+
+if [[ ! -f "$ROOT/tools/bo1_probe.h" ]]; then
+    echo "::error::tools/bo1_probe.h não encontrado."
+    exit 7
+fi
+
+cp "$ROOT/tools/bo1_probe.h" "$ROOT/XenonRecomp/XenonAnalyse/bo1_probe.h"
+
+if ! grep -q 'bo1_probe.h' "$MAIN_CPP"; then
+    sed -i 's|#include "function.h"|#include "function.h"\n#include "bo1_probe.h"|' "$MAIN_CPP"
+    sed -i 's|^\(\s*\)auto image = Image::ParseImage(file.data(), file.size());|&\n\1BO1Probe(image);|' "$MAIN_CPP"
+fi
+
+if ! grep -q 'bo1_probe.h' "$MAIN_CPP" || ! grep -q 'BO1Probe(image);' "$MAIN_CPP"; then
+    echo "::error::Não consegui inserir a sonda no main.cpp do XenonAnalyse."
+    echo "O arquivo oficial pode ter mudado. Trecho relevante:"
+    grep -n 'include\|ParseImage' "$MAIN_CPP" || true
+    exit 7
+fi
+
 echo "==> Configurando XenonRecomp"
 
 cmake \
@@ -82,6 +105,12 @@ echo "==> Analisando o executável BO1"
 
 "$ANALYSER" "$XEX" "$OUTPUT" 2>&1 | tee "$LOG"
 
+echo
+echo "==== INICIO PROBE ===="
+grep '^\[probe\]' "$LOG" || echo "(nenhuma linha de probe)"
+echo "==== FIM PROBE ===="
+echo
+
 if [[ ! -s "$OUTPUT" ]]; then
     echo "::error::O analisador não produziu um arquivo de saída."
     exit 5
@@ -97,7 +126,7 @@ echo "Blocos de jump table encontrados: $BLOCKS"
 
 if [[ "$BLOCKS" -eq 0 ]]; then
     echo "::error::O TOML não contém nenhuma jump table. A análise não achou nada."
-    echo "Veja o diagnóstico do XEX e a saída do XenonAnalyse acima."
+    echo "Veja o bloco PROBE acima para entender os padrões do BO1."
     exit 6
 fi
 
