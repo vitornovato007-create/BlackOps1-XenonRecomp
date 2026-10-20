@@ -72,51 +72,13 @@ grep -i -E 'warn|unrecogn|unimpl|invalid|error|fail|unable' "$LOG" \
 echo "==== FIM RECOMP ===="
 echo
 
-echo "==> Anexando material de diagnóstico ao fim do TOML (como comentários)"
-
-append_file() {
-    local title="$1"
-    local path="$2"
-    local maxlines="$3"
-
-    {
-        echo "# ==== FILE: $title ===="
-
-        if [[ -f "$path" ]]; then
-            head -n "$maxlines" "$path" | sed 's/^/# /'
-        else
-            echo "# (nao encontrado: $path)"
-        fi
-
-        echo "# ==== END FILE ===="
-    } >> "$TOML_OUT"
-}
-
-SRC="$ROOT/XenonRecomp"
-
-append_file "xenonrecomp.log" "$LOG" 6000
-append_file "XenonRecomp/recompiler.cpp" "$SRC/XenonRecomp/recompiler.cpp" 20000
-append_file "XenonRecomp/recompiler.h" "$SRC/XenonRecomp/recompiler.h" 2000
-append_file "XenonRecomp/recompiler_config.cpp" "$SRC/XenonRecomp/recompiler_config.cpp" 1500
-append_file "XenonRecomp/recompiler_config.h" "$SRC/XenonRecomp/recompiler_config.h" 500
-append_file "XenonUtils/ppc_context.h" "$SRC/XenonUtils/ppc_context.h" 3000
-append_file "XenonUtils/image.h" "$SRC/XenonUtils/image.h" 500
-append_file "XenonAnalyse/function.h" "$SRC/XenonAnalyse/function.h" 500
-append_file "XenonAnalyse/function.cpp" "$SRC/XenonAnalyse/function.cpp" 2000
-
-SAMPLE="$(find "$OUT_DIR" -name 'ppc_recomp.0.cpp' -print -quit)"
-append_file "generated/ppc_recomp.0.cpp (inicio)" "${SAMPLE:-/nao/existe}" 150
-
-CONFIG_H="$(find "$OUT_DIR" -name 'ppc_config.h' -print -quit)"
-append_file "generated/ppc_config.h" "${CONFIG_H:-/nao/existe}" 200
+echo "==> Anexando o log do XenonRecomp ao fim do TOML (como comentários)"
 
 {
-    echo "# ==== FILE: lista de arquivos gerados ===="
-    find "$OUT_DIR" -type f -printf '%s %p\n' | sort -k2 | sed 's/^/# /'
+    echo "# ==== FILE: xenonrecomp.log ===="
+    head -n 6000 "$LOG" | sed 's/^/# /'
     echo "# ==== END FILE ===="
 } >> "$TOML_OUT"
-
-echo "Tamanho do TOML com anexos: $(stat -c %s "$TOML_OUT") bytes"
 
 if [[ "$STATUS" -ne 0 ]]; then
     echo "::error::O XenonRecomp terminou com erro (código $STATUS). Veja o bloco RECOMP acima."
@@ -130,3 +92,5 @@ fi
 
 echo "==> XenonRecomp terminou e gerou código C++."
 echo "ATENÇÃO: isso não prova que o código compila nem que o jogo funciona."
+
+bash "$ROOT/tools/check_generated.sh" || true
