@@ -66,7 +66,7 @@ if ! grep -q 'bo1_helpers.h' "$MAIN_CPP" || ! grep -q 'BO1FindHelpers(image);' "
     exit 7
 fi
 
-echo "==> Aplicando o patch do BO1 no recompiler.cpp"
+echo "==> Aplicando os patches do BO1 no recompiler.cpp"
 
 RECOMPILER_CPP="$ROOT/XenonRecomp/XenonRecomp/recompiler.cpp"
 
@@ -75,13 +75,23 @@ if [[ ! -f "$ROOT/tools/patch_recompiler.py" ]]; then
     exit 11
 fi
 
-if ! python3 "$ROOT/tools/patch_recompiler.py" "$RECOMPILER_CPP"; then
-    echo "::error::Não consegui aplicar o patch no recompiler.cpp (o arquivo oficial pode ter mudado)."
+if [[ ! -f "$ROOT/tools/patch_recompiler2.py" ]]; then
+    echo "::error::tools/patch_recompiler2.py não encontrado."
     exit 11
 fi
 
-if ! grep -q 'BO1_PATCH' "$RECOMPILER_CPP"; then
-    echo "::error::O patch não deixou marcas no recompiler.cpp."
+if ! python3 "$ROOT/tools/patch_recompiler.py" "$RECOMPILER_CPP"; then
+    echo "::error::Não consegui aplicar o patch 1 no recompiler.cpp (o arquivo oficial pode ter mudado)."
+    exit 11
+fi
+
+if ! python3 "$ROOT/tools/patch_recompiler2.py" "$RECOMPILER_CPP"; then
+    echo "::error::Não consegui aplicar o patch 2 no recompiler.cpp."
+    exit 11
+fi
+
+if ! grep -q 'BO1_PATCH2' "$RECOMPILER_CPP"; then
+    echo "::error::O patch 2 não deixou marcas no recompiler.cpp."
     exit 11
 fi
 
