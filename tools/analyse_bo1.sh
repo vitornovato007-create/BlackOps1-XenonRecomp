@@ -31,6 +31,8 @@ else
         "$ROOT/XenonRecomp"
 fi
 
+echo "XenonRecomp commit: $(git -C "$ROOT/XenonRecomp" rev-parse HEAD)"
+
 echo "==> Instalando o main.cpp ajustado do XenonAnalyse (BO1)"
 
 MAIN_CPP="$ROOT/XenonRecomp/XenonAnalyse/main.cpp"
@@ -62,6 +64,25 @@ if ! grep -q 'bo1_helpers.h' "$MAIN_CPP" || ! grep -q 'BO1FindHelpers(image);' "
     echo "::error::Não consegui inserir a busca de funções auxiliares no main.cpp."
     grep -n 'include\|ParseImage' "$MAIN_CPP" || true
     exit 7
+fi
+
+echo "==> Aplicando o patch do BO1 no recompiler.cpp"
+
+RECOMPILER_CPP="$ROOT/XenonRecomp/XenonRecomp/recompiler.cpp"
+
+if [[ ! -f "$ROOT/tools/patch_recompiler.py" ]]; then
+    echo "::error::tools/patch_recompiler.py não encontrado."
+    exit 11
+fi
+
+if ! python3 "$ROOT/tools/patch_recompiler.py" "$RECOMPILER_CPP"; then
+    echo "::error::Não consegui aplicar o patch no recompiler.cpp (o arquivo oficial pode ter mudado)."
+    exit 11
+fi
+
+if ! grep -q 'BO1_PATCH' "$RECOMPILER_CPP"; then
+    echo "::error::O patch não deixou marcas no recompiler.cpp."
+    exit 11
 fi
 
 echo "==> Configurando XenonRecomp"
