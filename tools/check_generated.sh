@@ -8,7 +8,7 @@ OUT_DIR="$ROOT/generated/ppc"
 TOML_OUT="$ROOT/generated/BO1_switch_tables.toml"
 CHECK_LOG="$ROOT/generated/compile_check.log"
 
-echo "==> Etapa 3: checagem de sintaxe do C++ gerado (clang++ -fsyntax-only)"
+echo "==> Etapa 3: checagens do C++ gerado"
 
 if ! command -v clang++ >/dev/null 2>&1; then
     echo "::warning::clang++ não encontrado, pulando a checagem."
@@ -30,49 +30,99 @@ pick() {
     grep -l -F -- "$pattern" "$OUT_DIR"/ppc_recomp.*.cpp 2>/dev/null | head -n 1 || true
 }
 
-CANDIDATES=("$OUT_DIR/ppc_recomp.0.cpp")
+# Arquivos prioritarios: os que contem o que mais mexemos
+PRIORITY=("$OUT_DIR/ppc_recomp.0.cpp")
 
 for pattern in 'loc_82566F5C:' '// vsel128' '// stfsu ' '// lhzu ' '// bdzf'; do
     found="$(pick "$pattern")"
 
     if [[ -n "$found" ]]; then
-        CANDIDATES+=("$found")
+        PRIORITY+=("$found")
     fi
 done
 
-CANDIDATES+=("$OUT_DIR/ppc_func_mapping.cpp")
+PRIORITY+=("$OUT_DIR/ppc_func_mapping.cpp")
 
-mapfile -t FILES < <(printf '%s\n' "${CANDIDATES[@]}" | sort -u)
+mapfile -t PRIORITY_FILES < <(printf '%s\n' "${PRIORITY[@]}" | awk '!seen[$0]++')
+
+# Todos os arquivos, com os prioritarios primeiro
+mapfile -t ALL_FILES < <( { printf '%s\n' "${PRIORITY_FILES[@]}"; find "$OUT_DIR" -name '*.cpp' | sort; } | awk '!seen[$0]++')
 
 : > "$CHECK_LOG"
 
-for file in "${FILES[@]}"; do
-    name="$(basename "$file")"
-    echo "---- $name ----" >> "$CHECK_LOG"
+check_batch() {
+    # $1 = rotulo, $2 = compilador, $3 = limite de tempo (s), demais = arquivos
+    local label="$1"
+    local compiler="$2"
+    local budget="$3"
+    shift 3
 
-    start="$(date +%s)"
+    local ok=0
+    local failed=0
+    local skipped=0
+    local started="$SECONDS"
+    local file
+    local name
+    local status
 
-    set +e
-    timeout 400 clang++ -std=c++20 -fsyntax-only -w -ferror-limit=40 \
-        -I"$OUT_DIR" -I"$SIMDE_DIR" "$file" >> "$CHECK_LOG" 2>&1
-    status=$?
-    set -e
+    for file in "$@"; do
+        if (( SECONDS - started > budget )); then
+            skipped=$((skipped + 1))
+            continue
+        fi
 
-    end="$(date +%s)"
+        name="$(basename "$file")"
+        echo "---- [$label] $name ----" >> "$CHECK_LOG"
 
-    echo "RESULT $name saida=$status tempo=$((end - start))s" >> "$CHECK_LOG"
-    echo "$name: saida=$status tempo=$((end - start))s"
-done
+        set +e
+        timeout 300 "$compiler" -std=c++20 -fsyntax-only -w -ferror-limit=20 \
+            -I"$OUT_DIR" -I"$SIMDE_DIR" "$file" >> "$CHECK_LOG" 2>&1
+        status=$?
+        set -e
 
-TOTAL_ERRORS="$(grep -c 'error:' "$CHECK_LOG" || true)"
+        if [[ "$status" -eq 0 ]]; then
+            ok=$((ok + 1))
+        else
+            failed=$((failed + 1))
+            echo "RESULT [$label] $name saida=$status" >> "$CHECK_LOG"
+        fi
+    done
+
+    echo "RESUMO [$label] ok=$ok falhou=$failed nao_testados_por_tempo=$skipped tempo=$((SECONDS - started))s" | tee -a "$CHECK_LOG"
+}
+
+echo "==> x86_64: sintaxe de todos os arquivos (limite de 600 s)"
+check_batch "x86_64" clang++ 600 "${ALL_FILES[@]}"
+
+# ARM64 com o NDK do Android, se existir no runner
+NDK_ROOT="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-}}"
+
+if [[ -z "$NDK_ROOT" ]]; then
+    NDK_ROOT="$(find /usr/local/lib/android/sdk/ndk -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1 || true)"
+fi
+
+NDK_CLANG=""
+
+if [[ -n "$NDK_ROOT" ]]; then
+    NDK_CLANG="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android29-clang++"
+fi
+
+if [[ -n "$NDK_CLANG" && -x "$NDK_CLANG" ]]; then
+    echo "==> ARM64 (NDK): sintaxe dos arquivos prioritarios (limite de 240 s)"
+    echo "NDK: $NDK_ROOT"
+    check_batch "arm64" "$NDK_CLANG" 240 "${PRIORITY_FILES[@]}"
+else
+    echo "RESUMO [arm64] NDK do Android nao encontrado, pulado" | tee -a "$CHECK_LOG"
+fi
 
 echo
 echo "==== INICIO COMPILE ===="
-echo "Arquivos checados: ${#FILES[@]}"
-echo "Total de linhas com error: $TOTAL_ERRORS"
+grep '^RESUMO' "$CHECK_LOG" || true
 echo
-echo "-- resultado por arquivo --"
-grep '^RESULT' "$CHECK_LOG" || true
+echo "Total de linhas com error: $(grep -c 'error:' "$CHECK_LOG" || true)"
+echo
+echo "-- arquivos que falharam --"
+grep '^RESULT' "$CHECK_LOG" | head -n 20 || true
 echo
 echo "-- erros mais frequentes (números normalizados) --"
 grep 'error:' "$CHECK_LOG" \
@@ -87,10 +137,37 @@ grep 'error:' "$CHECK_LOG" \
 echo "==== FIM COMPILE ===="
 echo
 
+echo "==> Checagem de ligacao: funcoes declaradas x definidas"
+
+DECLARED="$ROOT/generated/declared_funcs.txt"
+DEFINED="$ROOT/generated/defined_funcs.txt"
+MISSING="$ROOT/generated/missing_funcs.txt"
+
+grep -o 'PPC_EXTERN_FUNC([A-Za-z0-9_]*)' "$OUT_DIR/ppc_recomp_shared.h" \
+    | sed 's/PPC_EXTERN_FUNC(//; s/)//' | sort -u > "$DECLARED" || true
+
+grep -h -o 'PPC_WEAK_FUNC([A-Za-z0-9_]*)' "$OUT_DIR"/ppc_recomp.*.cpp \
+    | sed 's/PPC_WEAK_FUNC(//; s/)//' | sort -u > "$DEFINED" || true
+
+comm -23 "$DECLARED" "$DEFINED" > "$MISSING" || true
+
+echo
+echo "==== INICIO LINK ===="
+echo "Funcoes declaradas: $(wc -l < "$DECLARED")"
+echo "Funcoes definidas: $(wc -l < "$DEFINED")"
+echo "Declaradas sem definicao: $(wc -l < "$MISSING")"
+echo "-- primeiras 40 sem definicao --"
+head -n 40 "$MISSING" || true
+echo "==== FIM LINK ===="
+echo
+
 {
     echo "# ==== FILE: compile_check.log ===="
     head -n 4000 "$CHECK_LOG" | sed 's/^/# /'
     echo "# ==== END FILE ===="
+    echo "# ==== FILE: missing_funcs.txt ===="
+    head -n 3000 "$MISSING" | sed 's/^/# /'
+    echo "# ==== END FILE ===="
 } >> "$TOML_OUT"
 
-echo "==> Checagem de sintaxe terminou (isto não gera binário nem prova que o jogo roda)."
+echo "==> Checagens terminaram (isto não gera binário nem prova que o jogo roda)."
