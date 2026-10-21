@@ -70,28 +70,27 @@ echo "==> Aplicando os patches do BO1 no recompiler.cpp"
 
 RECOMPILER_CPP="$ROOT/XenonRecomp/XenonRecomp/recompiler.cpp"
 
-if [[ ! -f "$ROOT/tools/patch_recompiler.py" ]]; then
-    echo "::error::tools/patch_recompiler.py não encontrado."
-    exit 11
-fi
+# Ordem: patch_recompiler.py, depois patch_recompiler2.py, patch_recompiler3.py, ...
+PATCHES=("$ROOT/tools/patch_recompiler.py")
+mapfile -t NUMBERED_PATCHES < <(find "$ROOT/tools" -maxdepth 1 -name 'patch_recompiler[0-9]*.py' | sort -V)
+PATCHES+=("${NUMBERED_PATCHES[@]}")
 
-if [[ ! -f "$ROOT/tools/patch_recompiler2.py" ]]; then
-    echo "::error::tools/patch_recompiler2.py não encontrado."
-    exit 11
-fi
+for patch in "${PATCHES[@]}"; do
+    if [[ ! -f "$patch" ]]; then
+        echo "::error::Patch não encontrado: $patch"
+        exit 11
+    fi
 
-if ! python3 "$ROOT/tools/patch_recompiler.py" "$RECOMPILER_CPP"; then
-    echo "::error::Não consegui aplicar o patch 1 no recompiler.cpp (o arquivo oficial pode ter mudado)."
-    exit 11
-fi
+    echo "Aplicando $(basename "$patch")"
 
-if ! python3 "$ROOT/tools/patch_recompiler2.py" "$RECOMPILER_CPP"; then
-    echo "::error::Não consegui aplicar o patch 2 no recompiler.cpp."
-    exit 11
-fi
+    if ! python3 "$patch" "$RECOMPILER_CPP"; then
+        echo "::error::Não consegui aplicar $(basename "$patch") no recompiler.cpp (o arquivo oficial pode ter mudado)."
+        exit 11
+    fi
+done
 
-if ! grep -q 'BO1_PATCH2' "$RECOMPILER_CPP"; then
-    echo "::error::O patch 2 não deixou marcas no recompiler.cpp."
+if ! grep -q 'BO1_PATCH' "$RECOMPILER_CPP"; then
+    echo "::error::Os patches não deixaram marcas no recompiler.cpp."
     exit 11
 fi
 
