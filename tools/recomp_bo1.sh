@@ -94,3 +94,11 @@ echo "==> XenonRecomp terminou e gerou código C++."
 echo "ATENÇÃO: isso não prova que o código compila nem que o jogo funciona."
 
 bash "$ROOT/tools/check_generated.sh" || true
+
+# Passos extras: qualquer tools/post_*.sh roda aqui, em ordem alfabetica
+for post in "$ROOT"/tools/post_*.sh; do
+    if [[ -f "$post" ]]; then
+        echo "==> Executando $(basename "$post")"
+        bash "$post" || true
+    fi
+done
