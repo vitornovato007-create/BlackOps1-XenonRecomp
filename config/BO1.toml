@@ -23,4 +23,6 @@ savevmx_14_address = 0x825FA880
 restvmx_64_address = 0x825FABAC
 savevmx_64_address = 0x825FA914
 
-# setjmp_address e longjmp_address: ainda nao localizados no BO1.
+# setjmp e longjmp do BO1 (confirmados pelo C++ gerado).
+setjmp_address = 0x825FB540
+longjmp_address = 0x825FB940
