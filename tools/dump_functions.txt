@@ -1,6 +1,10 @@
 # Funcoes cujo C++ gerado sera anexado ao artefato (uma por linha).
-# setjmp (candidata), longjmp (candidata) e os outros chamadores de RtlUnwind:
-sub_825FB540
-sub_825FB940
-sub_825FDFB0
-sub_8260A430
+# Candidatas do D3D9 do BO1:
+sub_824B6460
+sub_824B4D70
+sub_824B3C50
+sub_824B3D48
+sub_824BEC98
+sub_824A7370
+sub_825AF4A8
+sub_825AFCE0
