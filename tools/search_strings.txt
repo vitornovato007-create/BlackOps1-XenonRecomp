@@ -1,0 +1,13 @@
+# Textos (sem diferenciar maiusculas) para procurar no executavel, um por linha.
+pixel shader
+vertex shader
+CreatePixelShader
+CreateVertexShader
+D3DERR
+device lost
+GPU hang
+r_vsync
+Direct3D
+R_Init
+R_EndFrame
+shader failed
