@@ -1,10 +1,14 @@
 # Funcoes cujo C++ gerado sera anexado ao artefato (uma por linha).
-# Candidatas do D3D9 do BO1:
-sub_824B6460
-sub_824B4D70
-sub_824B3C50
-sub_824B3D48
-sub_824BEC98
-sub_824A7370
-sub_825AF4A8
-sub_825AFCE0
+# Outros chamadores do vigia de travamento da GPU (candidatas a espera da arena):
+sub_824A5748
+sub_824A57E0
+sub_824A5E90
+sub_824B5580
+sub_824B5998
+# Entradas mais chamadas da biblioteca D3D9 (candidatas a Present e a shaders):
+sub_824AFE38
+sub_824B4020
+sub_824B3FE0
+sub_824A6FF0
+sub_824A70F8
+sub_824C0E00
