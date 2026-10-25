@@ -1,11 +1,16 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstddef>
+#include <fstream>
+#include <string>
 #include <vector>
 
-// Procura as funcoes auxiliares de salvar/restaurar registradores no codigo do BO1.
-// So imprime linhas que comecam com [helpers]. Nao altera a analise.
+// Procura as funcoes auxiliares de salvar/restaurar registradores no codigo do BO1
+// e textos (strings) escolhidos em tools/search_strings.txt.
+// So imprime linhas que comecam com [helpers] ou [strings]. Nao altera a analise.
 
 static uint32_t BO1ReadBE(const uint8_t* p)
 {
@@ -53,6 +58,113 @@ static void BO1FindOne(Image& image, const char* name, const std::vector<uint32_
     fmt::println("[helpers] {}: {} ocorrencia(s)", name, found);
 }
 
+static std::string BO1Lower(std::string s)
+{
+    for (auto& c : s)
+    {
+        c = (char)std::tolower((unsigned char)c);
+    }
+
+    return s;
+}
+
+static void BO1FindStrings(Image& image)
+{
+    std::ifstream in("tools/search_strings.txt");
+
+    if (!in.is_open())
+    {
+        fmt::println("[strings] tools/search_strings.txt nao encontrado");
+        return;
+    }
+
+    std::vector<std::string> patterns;
+    std::string line;
+
+    while (std::getline(in, line))
+    {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+        {
+            line.pop_back();
+        }
+
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+
+        patterns.push_back(line);
+    }
+
+    for (const auto& pattern : patterns)
+    {
+        std::string needle = BO1Lower(pattern);
+        size_t found = 0;
+
+        for (const auto& section : image.sections)
+        {
+            if (section.data == nullptr || section.size < needle.size())
+            {
+                continue;
+            }
+
+            if (section.flags & SectionFlags_Code)
+            {
+                continue;
+            }
+
+            const uint8_t* data = section.data;
+            size_t size = section.size;
+
+            for (size_t i = 0; i + needle.size() <= size; i++)
+            {
+                size_t k = 0;
+
+                while (k < needle.size() && std::tolower(data[i + k]) == (unsigned char)needle[k])
+                {
+                    k++;
+                }
+
+                if (k != needle.size())
+                {
+                    continue;
+                }
+
+                size_t start = i;
+
+                while (start > 0 && i - start < 64 && data[start - 1] >= 0x20 && data[start - 1] < 0x7F)
+                {
+                    start--;
+                }
+
+                size_t end = i + needle.size();
+
+                while (end < size && end - start < 120 && data[end] >= 0x20 && data[end] < 0x7F)
+                {
+                    end++;
+                }
+
+                std::string text((const char*)data + start, end - start);
+                fmt::println("[strings] {} 0x{:X} \"{}\"", pattern, (uint64_t)(section.base + start), text);
+
+                found++;
+
+                if (found >= 12)
+                {
+                    break;
+                }
+            }
+
+            if (found >= 12)
+            {
+                break;
+            }
+        }
+
+        fmt::println("[strings] {}: {} ocorrencia(s) (mostra no maximo 12)", pattern, found);
+    }
+}
+
 static void BO1FindHelpers(Image& image)
 {
     std::vector<uint32_t> restGpr, saveGpr, restFpr, saveFpr;
@@ -76,4 +188,6 @@ static void BO1FindHelpers(Image& image)
     BO1FindOne(image, "savevmx_14_address", { 0x3960FEE0u, 0x7DCB61CEu });
     BO1FindOne(image, "restvmx_64_address", { 0x3960FC00u, 0x100B60CBu });
     BO1FindOne(image, "savevmx_64_address", { 0x3960FC00u, 0x100B61CBu });
+
+    BO1FindStrings(image);
 }
