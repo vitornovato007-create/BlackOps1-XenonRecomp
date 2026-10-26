@@ -1,0 +1,6 @@
+# Padroes (texto exato) para procurar no C++ gerado. Uma linha por padrao.
+# Opcional: limite de enderecos de funcao com " @INICIO-FIM" (8 digitos hex).
+271319040
+__imp__KeSetEvent(ctx, base) @824A0000-824D0000
+__imp__ExCreateThread(ctx, base)
+__imp__KeWaitForSingleObject(ctx, base) @824A0000-824D0000
