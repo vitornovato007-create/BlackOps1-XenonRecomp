@@ -1,0 +1,50 @@
+name: BlackOps1 XenonRecomp Pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang git shellcheck python3
+
+      - name: Validar os scripts
+        run: |
+          bash -n build.sh
+          shellcheck build.sh
+          for f in tools/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Verificar o executável de entrada
+        run: |
+          test -f game/default.xex
+          ls -l game/default.xex
+
+      - name: Executar o pipeline (análise, XenonRecomp e verificações)
+        run: |
+          chmod +x build.sh tools/*.sh
+          ./build.sh game/default.xex
+
+      - name: Verificar a tabela de jump tables
+        run: test -s generated/BO1_switch_tables.toml
+
+      - name: Publicar o artefato
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bo1-switch-tables
+          path: generated/BO1_switch_tables.toml
+          if-no-files-found: warn
