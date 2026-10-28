@@ -42,6 +42,7 @@ class MainActivity : Activity() {
 
     companion object {
         const val REQUEST_PICK_ISO = 1001
+        const val REQUEST_PICK_FOLDER = 1002
         const val EXPECTED_XEX_SIZE = 8310784L
         const val PREFS = "bo1_launcher"
         const val MARGIN_BYTES = 300L * 1024L * 1024L
@@ -54,6 +55,7 @@ class MainActivity : Activity() {
     private lateinit var detailText: TextView
     private lateinit var progressBar: ProgressBar
     private lateinit var pickButton: Button
+    private lateinit var pickFolderButton: Button
     private lateinit var importButton: Button
     private lateinit var cancelButton: Button
     private lateinit var startButton: Button
@@ -61,10 +63,15 @@ class MainActivity : Activity() {
 
     private var pickedUri: Uri? = null
     private var pickedFiles: List<IsoFile> = emptyList()
+    private var pickedFolderUri: Uri? = null
+    private var pickedFolderFiles: List<FolderFile> = emptyList()
+    private var folderMode = false
+    private var importing = false
     private var canImport = false
     private var ready = false
     private var busy = false
     private var importer: Importer? = null
+    private var folderImporter: FolderImporter? = null
 
     private val colorBackground = Color.parseColor("#12161C")
     private val colorCard = Color.parseColor("#1B2129")
@@ -160,12 +167,19 @@ class MainActivity : Activity() {
         pickButton.setOnClickListener { pickIso() }
         card.addView(pickButton)
 
+        pickFolderButton = makeButton("Selecionar pasta do jogo (já extraída)", colorSecondary)
+        pickFolderButton.setOnClickListener { pickFolder() }
+        card.addView(pickFolderButton)
+
         importButton = makeButton("Importar para o aplicativo", colorSecondary)
         importButton.setOnClickListener { startImport() }
         card.addView(importButton)
 
         cancelButton = makeButton("Cancelar importação", colorDanger)
-        cancelButton.setOnClickListener { importer?.cancelled = true }
+        cancelButton.setOnClickListener {
+            importer?.cancelled = true
+            folderImporter?.cancelled = true
+        }
         card.addView(cancelButton)
 
         startButton = makeButton("Iniciar jogo", colorAccent)
@@ -202,11 +216,12 @@ class MainActivity : Activity() {
 
     private fun refreshButtons() {
         setEnabled(pickButton, !busy)
+        setEnabled(pickFolderButton, !busy)
         setEnabled(importButton, !busy && canImport, visible = canImport)
-        setEnabled(cancelButton, busy && importer != null, visible = busy && importer != null)
+        setEnabled(cancelButton, busy && importing, visible = busy && importing)
         setEnabled(startButton, !busy && ready)
         setEnabled(deleteButton, !busy && ready, visible = ready)
-        progressBar.visibility = if (busy && importer != null) View.VISIBLE else View.GONE
+        progressBar.visibility = if (busy && importing) View.VISIBLE else View.GONE
     }
 
     private fun show(status: String, detail: String, error: Boolean = false) {
@@ -238,8 +253,9 @@ class MainActivity : Activity() {
         } else {
             show(
                 "1/3 · Selecione a ISO do jogo",
-                "Escolha o arquivo .iso do disco do Black Ops 1 (Xbox 360). " +
-                    "Prefira um arquivo no armazenamento do próprio aparelho."
+                "Escolha o arquivo .iso do disco do Black Ops 1 (Xbox 360) ou uma pasta " +
+                    "com os arquivos já extraídos (precisa conter o default.xex). " +
+                    "Prefira arquivos no armazenamento do próprio aparelho."
             )
         }
 
@@ -256,15 +272,36 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQUEST_PICK_ISO)
     }
 
+    private fun pickFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        startActivityForResult(intent, REQUEST_PICK_FOLDER)
+    }
+
     @Deprecated("Usa a API classica de Activity para manter o projeto simples")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode != REQUEST_PICK_ISO || resultCode != RESULT_OK) {
+        if (resultCode != RESULT_OK) {
             return
         }
 
         val uri = data?.data ?: return
+
+        if (requestCode == REQUEST_PICK_FOLDER) {
+            try {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (e: Exception) {
+                // sem permissao persistente; a leitura agora continua valendo
+            }
+
+            analyzeFolder(uri)
+            return
+        }
+
+        if (requestCode != REQUEST_PICK_ISO) {
+            return
+        }
 
         try {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -284,6 +321,8 @@ class MainActivity : Activity() {
 
     private fun analyze(uri: Uri) {
         busy = true
+        importing = false
+        folderMode = false
         canImport = false
         show("2/3 · Analisando a ISO…", "Lendo o sistema de arquivos do disco. Isso leva alguns segundos.")
         refreshButtons()
@@ -346,7 +385,9 @@ class MainActivity : Activity() {
 
     private fun onError(message: String) {
         busy = false
+        importing = false
         importer = null
+        folderImporter = null
         show("Algo deu errado", message, error = true)
         refreshButtons()
     }
@@ -354,6 +395,14 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ importar
 
     private fun startImport() {
+        if (folderMode) {
+            startFolderImport()
+        } else {
+            startIsoImport()
+        }
+    }
+
+    private fun startIsoImport() {
         val uri = pickedUri ?: return
         val files = pickedFiles
 
@@ -362,6 +411,7 @@ class MainActivity : Activity() {
         val finalDir = gameDir()
 
         busy = true
+        importing = true
         progressBar.progress = 0
         show("Importando…", "Copiando os arquivos do jogo. Não feche o aplicativo.")
 
@@ -414,7 +464,7 @@ class MainActivity : Activity() {
     }
 
     private fun onProgress(done: Long, total: Long, current: String) {
-        val percent = if (total > 0L) (done * 1000L / total).toInt() else 0
+        val percent = if (total > 0L) (done * 1000L / total).toInt().coerceAtMost(1000) else 0
         progressBar.progress = percent
 
         show(
@@ -425,11 +475,158 @@ class MainActivity : Activity() {
 
     private fun onImported() {
         busy = false
+        importing = false
         importer = null
+        folderImporter = null
         canImport = false
         pickedUri = null
         pickedFiles = emptyList()
+        pickedFolderUri = null
+        pickedFolderFiles = emptyList()
         refreshFromDisk()
+    }
+
+    // ------------------------------------------------------------------ pasta ja extraida
+
+    private fun analyzeFolder(treeUri: Uri) {
+        busy = true
+        importing = false
+        folderMode = true
+        canImport = false
+        show("2/3 · Analisando a pasta…", "Listando os arquivos. Isso pode levar alguns segundos.")
+        refreshButtons()
+
+        Thread {
+            try {
+                val all = FolderScanner.scan(contentResolver, treeUri)
+
+                // acha o default.xex mais perto da raiz; se estiver numa subpasta, usa ela como raiz do jogo
+                val candidates = all.filter {
+                    it.path.substringAfterLast('/').equals("default.xex", ignoreCase = true)
+                }
+
+                val best = candidates.minByOrNull { it.path.count { c -> c == '/' } }
+                    ?: throw IOException("default.xex não encontrado na pasta escolhida.")
+
+                val prefix = if (best.path.contains('/')) best.path.substringBeforeLast('/') + "/" else ""
+
+                val files = all
+                    .filter { it.path.startsWith(prefix) }
+                    .map { FolderFile(it.path.removePrefix(prefix), it.uri, it.size) }
+
+                val xex = files.first { it.path.equals("default.xex", ignoreCase = true) }
+
+                val head = ByteArray(4)
+                var read = 0
+
+                contentResolver.openInputStream(xex.uri)?.use { stream ->
+                    while (read < 4) {
+                        val n = stream.read(head, read, 4 - read)
+
+                        if (n < 0) {
+                            break
+                        }
+
+                        read += n
+                    }
+                }
+
+                if (read < 4 || String(head, Charsets.US_ASCII) != "XEX2") {
+                    throw IOException("O default.xex da pasta não tem o formato esperado (XEX2).")
+                }
+
+                val total = files.fold(0L) { acc, f -> acc + f.size }
+                ui.post { onFolderAnalyzed(treeUri, files, total, xex.size, prefix) }
+            } catch (e: Exception) {
+                ui.post { onError("Falha ao analisar a pasta: ${e.message}") }
+            }
+        }.start()
+    }
+
+    private fun onFolderAnalyzed(treeUri: Uri, files: List<FolderFile>, total: Long, xexSize: Long, prefix: String) {
+        pickedFolderUri = treeUri
+        pickedFolderFiles = files
+        busy = false
+
+        val free = StatFs(gameBaseDir().absolutePath).availableBytes
+        val enough = free >= total + MARGIN_BYTES
+
+        val version = if (xexSize == EXPECTED_XEX_SIZE) {
+            "versão reconhecida"
+        } else {
+            "ATENÇÃO: tamanho diferente do esperado ($EXPECTED_XEX_SIZE bytes); o código recompilado pode não servir"
+        }
+
+        val where = if (prefix.isEmpty()) "" else "\nO default.xex estava na subpasta \"${prefix.trimEnd('/')}\"; ela será usada como raiz do jogo."
+
+        canImport = enough
+
+        show(
+            if (enough) "2/3 · Pasta válida" else "2/3 · Espaço insuficiente",
+            "${files.size} arquivos · ${formatBytes(total)}\n" +
+                "default.xex: $xexSize bytes ($version)\n" +
+                "Espaço livre: ${formatBytes(free)}" +
+                where +
+                if (enough) "" else "\nLibere pelo menos ${formatBytes(total + MARGIN_BYTES - free)} e tente de novo.",
+            error = !enough
+        )
+
+        refreshButtons()
+    }
+
+    private fun startFolderImport() {
+        val files = pickedFolderFiles
+
+        if (files.isEmpty()) {
+            return
+        }
+
+        val base = gameBaseDir()
+        val tmp = File(base, "game_tmp")
+        val finalDir = gameDir()
+
+        busy = true
+        importing = true
+        progressBar.progress = 0
+        show("Importando…", "Copiando os arquivos do jogo. Não feche o aplicativo.")
+
+        refreshButtons()
+
+        Thread {
+            try {
+                tmp.deleteRecursively()
+                tmp.mkdirs()
+
+                val worker = FolderImporter(contentResolver)
+                folderImporter = worker
+
+                val result = worker.importAll(files, tmp) { done, total, current ->
+                    ui.post { onProgress(done, total, current) }
+                }
+
+                finalDir.deleteRecursively()
+
+                if (!tmp.renameTo(finalDir)) {
+                    throw IOException("Não consegui finalizar a pasta do jogo")
+                }
+
+                prefs.edit()
+                    .putBoolean("ready", true)
+                    .putLong("files", result.files.toLong())
+                    .putLong("bytes", result.bytes)
+                    .putLong("xex_size", result.xexSize)
+                    .putString("xex_sha256", result.xexSha256)
+                    .apply()
+
+                ui.post { onImported() }
+            } catch (e: ImportCancelled) {
+                tmp.deleteRecursively()
+                ui.post { onError("Importação cancelada.") }
+            } catch (e: Exception) {
+                tmp.deleteRecursively()
+                ui.post { onError("Falha na importação: ${e.message}") }
+            }
+        }.start()
     }
 
     // ------------------------------------------------------------------ iniciar e apagar
