@@ -632,7 +632,7 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ iniciar e apagar
 
     private fun startGame() {
-        val intent = Intent(this, GameActivity::class.java)
+        val intent = Intent(this, RuntimeActivity::class.java)
         intent.putExtra("game_dir", gameDir().absolutePath)
         intent.putExtra("xex_sha256", prefs.getString("xex_sha256", ""))
         startActivity(intent)
