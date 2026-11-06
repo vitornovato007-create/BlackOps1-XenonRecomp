@@ -42,6 +42,13 @@ jobs:
       - name: Gerar as funções de kernel de teste
         run: python3 tools/gen_kernel_stubs.py generated
 
+      - name: Diagnosticar estrutura do simde
+        run: |
+          echo "=== Procurando avx.h do simde ==="
+          find "$GITHUB_WORKSPACE/XenonRecomp/thirdparty" -name "avx.h" -path "*simde*" 2>/dev/null || echo "avx.h não encontrado em thirdparty"
+          echo "=== Conteúdo de thirdparty/simde (se existir) ==="
+          ls -la "$GITHUB_WORKSPACE/XenonRecomp/thirdparty/simde" 2>/dev/null || echo "Pasta thirdparty/simde não existe"
+
       - name: Compilar o APK (inclui o código recompilado)
         working-directory: android
         run: |
