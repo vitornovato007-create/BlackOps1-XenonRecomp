@@ -62,7 +62,7 @@ if(HAVE_RECOMP)
         "${TP}/libmspack/libmspack/mspack"
         "${TP}/disasm"
         "${TP}/xxHash"
-        "${TP}/simde/simde"
+        "${TP}"
     )
 else()
     message(STATUS "BO1: compilando SEM o codigo recompilado")
