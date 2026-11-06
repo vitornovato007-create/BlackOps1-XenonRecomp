@@ -33,6 +33,31 @@ fi
 
 echo "XenonRecomp commit: $(git -C "$ROOT/XenonRecomp" rev-parse HEAD)"
 
+echo "==> Garantindo ppc_context.h compatível com ARM64"
+
+PPC_CTX="$ROOT/XenonRecomp/XenonUtils/ppc_context.h"
+
+if [[ ! -f "$PPC_CTX" ]]; then
+    echo "::error::ppc_context.h não encontrado no clone do XenonRecomp."
+    exit 8
+fi
+
+if grep -q "simde/x86/avx.h" "$PPC_CTX"; then
+    echo "ppc_context.h já tem suporte a simde/ARM64."
+else
+    echo "AVISO: ppc_context.h sem simde. Aplicando patch para ARM64..."
+
+    sed -i 's|#include <x86/avx.h>|#if defined(__aarch64__)\n#include <simde/x86/avx.h>\n#else\n#include <x86/avx.h>\n#endif|' "$PPC_CTX"
+
+    if grep -q "simde/x86/avx.h" "$PPC_CTX"; then
+        echo "Patch aplicado com sucesso."
+        grep -n "avx" "$PPC_CTX" | head -5
+    else
+        echo "::error::Não consegui aplicar o patch no ppc_context.h."
+        exit 8
+    fi
+fi
+
 echo "==> Instalando o main.cpp ajustado do XenonAnalyse (BO1)"
 
 MAIN_CPP="$ROOT/XenonRecomp/XenonAnalyse/main.cpp"
