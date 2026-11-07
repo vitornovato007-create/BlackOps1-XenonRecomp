@@ -204,11 +204,21 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
         }
     } else {
         uint64_t fault = g_faultAddress;
-        char text[96];
+        // CORRECAO 1: logar o PC (program counter) no momento da falha.
+        // O nome do campo pode variar (pc, cia, nip, etc.) - ajustar se
+        // o compilador reclamar que o campo nao existe.
+        uint64_t pc = 0;
+        // Tenta ler o PC do contexto. Se o PPCContext tiver .pc, use direto.
+        // Se nao, este bloco precisa ser ajustado conforme o ppc_context.h.
+        // pc = (uint64_t)ctx.pc;
+        char text[160];
         if (fault>=(uint64_t)(uintptr_t)g_base && fault<(uint64_t)(uintptr_t)g_base+kArenaSize)
-            snprintf(text,sizeof(text),"endereco do jogo 0x%llX",(unsigned long long)(fault-(uint64_t)(uintptr_t)g_base));
+            snprintf(text,sizeof(text),"endereco do jogo 0x%llX (PC=0x%llX)",
+                     (unsigned long long)(fault-(uint64_t)(uintptr_t)g_base),
+                     (unsigned long long)pc);
         else
-            snprintf(text,sizeof(text),"endereco do aparelho 0x%llX",(unsigned long long)fault);
+            snprintf(text,sizeof(text),"endereco do aparelho 0x%llX (PC=0x%llX)",
+                     (unsigned long long)fault, (unsigned long long)pc);
         std::lock_guard<std::mutex> lk(g_stateMutex);
         g_endReason = std::string("falha de memoria em ")+text+" (ultima funcao: "+g_lastImport+")";
         g_state = 3;
