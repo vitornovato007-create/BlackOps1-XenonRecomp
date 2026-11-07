@@ -63,6 +63,7 @@ if(HAVE_RECOMP)
         "${TP}/disasm"
         "${TP}/xxHash"
         "${TP}"
+        "${TP}/TinySHA1"
     )
 else()
     message(STATUS "BO1: compilando SEM o codigo recompilado")
