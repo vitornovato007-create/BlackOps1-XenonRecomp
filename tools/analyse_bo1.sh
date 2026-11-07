@@ -42,16 +42,42 @@ if [[ ! -f "$PPC_CTX" ]]; then
     exit 8
 fi
 
-if grep -q "simde/x86/avx.h" "$PPC_CTX"; then
+if grep -q "simde/x86/" "$PPC_CTX"; then
     echo "ppc_context.h já tem suporte a simde/ARM64."
 else
     echo "AVISO: ppc_context.h sem simde. Aplicando patch para ARM64..."
 
-    sed -i 's|#include <x86/avx.h>|#if defined(__aarch64__)\n#include <simde/x86/avx.h>\n#else\n#include <x86/avx.h>\n#endif|' "$PPC_CTX"
+    # Substitui TODOS os includes <x86/*.h> por simde quando em ARM64
+    python3 - "$PPC_CTX" <<'PYEOF'
+import sys
+import re
 
-    if grep -q "simde/x86/avx.h" "$PPC_CTX"; then
+path = sys.argv[1]
+text = open(path).read()
+
+pattern = r'#include <x86/([^>]+)>'
+
+def replacer(match):
+    header = match.group(1)
+    return f'''#if defined(__aarch64__)
+#include <simde/x86/{header}>
+#else
+#include <x86/{header}>
+#endif'''
+
+new_text = re.sub(pattern, replacer, text)
+
+if new_text == text:
+    print("ERRO: nenhum include x86 encontrado para substituir.")
+    sys.exit(1)
+
+open(path, 'w').write(new_text)
+print("Includes x86 substituídos por simde condicional.")
+PYEOF
+
+    if grep -q "simde/x86/" "$PPC_CTX"; then
         echo "Patch aplicado com sucesso."
-        grep -n "avx" "$PPC_CTX" | head -5
+        grep -n "simde/x86\|x86/" "$PPC_CTX" | head -10
     else
         echo "::error::Não consegui aplicar o patch no ppc_context.h."
         exit 8
