@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -62,6 +63,7 @@ std::unordered_map<std::string,uint64_t> g_callCounts;
 
 thread_local sigjmp_buf* t_jump = nullptr;
 volatile uint64_t g_faultAddress = 0;
+volatile uint64_t g_faultPC = 0;
 
 constexpr uint64_t kArenaSize  = 0x100000000ull;
 constexpr uint64_t kTableStart = PPC_IMAGE_BASE + PPC_IMAGE_SIZE;
@@ -128,8 +130,14 @@ void Trace(const char* name, PPCContext& ctx) {
     if (count > 20000000ull) throw BootStop{std::string("importacao em laco: ")+name};
 }
 
-void SegvHandler(int, siginfo_t* info, void*) {
+void SegvHandler(int, siginfo_t* info, void* ucv) {
     g_faultAddress = (uint64_t)(uintptr_t)info->si_addr;
+    ucontext_t* uc = (ucontext_t*)ucv;
+#if defined(__aarch64__)
+    g_faultPC = (uint64_t)uc->uc_mcontext.pc;
+#elif defined(__x86_64__)
+    g_faultPC = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+#endif
     if (t_jump) siglongjmp(*t_jump, 1);
     _exit(139);
 }
@@ -204,13 +212,7 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
         }
     } else {
         uint64_t fault = g_faultAddress;
-        // CORRECAO 1: logar o PC (program counter) no momento da falha.
-        // O nome do campo pode variar (pc, cia, nip, etc.) - ajustar se
-        // o compilador reclamar que o campo nao existe.
-        uint64_t pc = 0;
-        // Tenta ler o PC do contexto. Se o PPCContext tiver .pc, use direto.
-        // Se nao, este bloco precisa ser ajustado conforme o ppc_context.h.
-        // pc = (uint64_t)ctx.pc;
+        uint64_t pc = g_faultPC;
         char text[160];
         if (fault>=(uint64_t)(uintptr_t)g_base && fault<(uint64_t)(uintptr_t)g_base+kArenaSize)
             snprintf(text,sizeof(text),"endereco do jogo 0x%llX (PC=0x%llX)",
