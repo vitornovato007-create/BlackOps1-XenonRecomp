@@ -4,13 +4,20 @@
 // Correcoes de diagnostico (em relacao ao runtime.cpp original):
 //   - MapRegions() cobre 0x82000000..0xA0000000 (imagem+globais) de uma vez
 //   - g_fault* -> thread_local (FaultInfo)
-//   - SegvHandler loga si_addr, fault_address, PC+offset no .so (dladdr),
+//   - SegvHandler loga fault_addr, fault_address, PC+offset no .so (dladdr),
 //     r1/r2/r13/lr/sp do ucontext_t
 //   - Commit() loga cada regiao (guest inicio/fim, MB, host inicio/fim, ok/falha)
 //   - BootThread loga constantes do ppc_config.h e estado de r2/r13 antes do _xstart
 //   - InitFunctionTable e LoadXex logam contadores e secoes ignoradas
 //   - Trace loga lr tambem
 //   - Mensagens de erro no formato "==== ... ===="
+//
+// Correcao 2026-11-08:
+//   - campo FaultInfo::si_addr renomeado para fault_addr (evita colisao com
+//     o macro `si_addr` de asm-generic/siginfo.h, que expande para
+//     `_sifields._sigfault._addr` e quebrava a compilacao com 5 erros).
+//   - `info->si_addr` no SegvHandler permanece intacto (ali o macro e o que
+//     acessa o campo real do siginfo_t).
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -70,7 +77,7 @@ std::unordered_map<std::string,uint64_t> g_callCounts;
 thread_local sigjmp_buf* t_jump = nullptr;
 
 struct FaultInfo {
-    uint64_t si_addr       = 0;
+    uint64_t fault_addr    = 0;   // renomeado de si_addr (colide com macro do kernel)
     uint64_t fault_address = 0;
     uint64_t pc            = 0;
     uint64_t pc_so_offset  = 0;
@@ -169,7 +176,9 @@ void Trace(const char* name, PPCContext& ctx) {
 }
 
 void SegvHandler(int, siginfo_t* info, void* ucv) {
-    t_fault.si_addr = (uint64_t)(uintptr_t)info->si_addr;
+    // info->si_addr permanece como macro do kernel (correto para siginfo_t*).
+    // O membro da nossa struct se chama fault_addr para nao colidir.
+    t_fault.fault_addr = (uint64_t)(uintptr_t)info->si_addr;
     t_fault.fault_address = 0;
 
     ucontext_t* uc = (ucontext_t*)ucv;
@@ -190,8 +199,8 @@ void SegvHandler(int, siginfo_t* info, void* ucv) {
     t_fault.lr  = 0;
 #endif
 
-    if (t_fault.si_addr == 0 && t_fault.fault_address != 0) {
-        t_fault.si_addr = t_fault.fault_address;
+    if (t_fault.fault_addr == 0 && t_fault.fault_address != 0) {
+        t_fault.fault_addr = t_fault.fault_address;
     }
 
     t_fault.pc_so_offset = 0;
@@ -314,7 +323,7 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
             g_endReason = std::string("==== excecao: ")+e.what()+" ===="; g_state = 3;
         }
     } else {
-        uint64_t fault      = t_fault.si_addr;
+        uint64_t fault      = t_fault.fault_addr;
         uint64_t fault_arm  = t_fault.fault_address;
         uint64_t pc         = t_fault.pc;
         uint64_t pc_off     = t_fault.pc_so_offset;
@@ -334,7 +343,7 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
 
         char text[1024];
         snprintf(text, sizeof(text),
-            "==== falha de memoria: si_addr=0x%llX fault_address=0x%llX "
+            "==== falha de memoria: fault_addr=0x%llX fault_address=0x%llX "
             "regiao=%s(+0x%llX) PC_abs=0x%llX PC_so=+0x%llX so=%s sym=%s "
             "r1=0x%llX r2=0x%llX r13=0x%llX lr=0x%llX sp=0x%llX "
             "base_host=0x%llX ultima_funcao='%s' ====",
