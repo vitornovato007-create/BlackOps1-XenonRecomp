@@ -6,19 +6,18 @@
 //   2026-11-08b: MapRegions cobre 0x0..0x100000000 (arena inteira)
 //   2026-11-08c: 6 sinais, LogRaw, beat a cada 5s, kPhysEnd 640MB,
 //                implementacao de XGetVideoMode, ExCreateThread, etc.
-//   2026-11-08d (esta):
-//     - std::set_terminate / std::set_unexpected: se uma excecao escapar
-//       ou std::thread for destruido sem join/detach, o runtime loga a
-//       causa via LogRaw ANTES de chamar abort(). O runtime.log vai mostrar
-//       "==== TERMINATE: <mensagem> ====".
-//     - beat.detach() em vez de beat.join(). Se RunGuest lançar ou
-//       abortar, o std::thread nao e destruido "joinable" (que causaria
-//       std::terminate -> abort).
-//     - RunGuest: se ocorrer SIGABRT/SIGILL/etc, o handler via
-//       siglongjmp cai no else, e o catch(...) do RunGuest captura
-//       std::exception para logar via LogRaw tambem.
-//     - Mensagens de "=== Fim" sempre via Log E LogRaw (redundancia
-//       para garantir que aparece mesmo se o FILE* estiver corrompido).
+//   2026-11-08d: std::set_terminate, beat.detach(), handlers de
+//                terminate/unexpected, catch(...) no RunGuest.
+//   2026-11-08e (esta):
+//     - removido std::set_unexpected / UnexpectedHandler. O std::unexpected
+//       foi removido do C++17, e o build usa std=gnu++20. O
+//       std::set_terminate sozinho cobre todos os casos praticos
+//       (excecao escapando de noexcept, std::thread sem join/detach,
+//       __cxa_pure_virtual, bad_alloc nao capturado, etc.).
+//     - o TerminateHandler loga a causa via LogRaw ANTES de chamar
+//       abort(). O runtime.log vai mostrar "==== TERMINATE: <msg> ====".
+//     - beat.detach() em vez de beat.join(): se RunGuest abortar, o
+//       std::thread nao e destruido "joinable".
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -205,7 +204,7 @@ void Trace(const char* name, PPCContext& ctx) {
     if (count > 20000000ull) throw BootStop{std::string("==== importacao em laco: ")+name+" ===="};
 }
 
-// ---- handlers de sinais ----
+// ---- handler de sinais ----
 
 void SegvHandler(int signo, siginfo_t* info, void* ucv) {
     t_fault.fault_addr = (uint64_t)(uintptr_t)info->si_addr;
@@ -282,7 +281,17 @@ void InstallSignalHandler() {
     Log("Sinais instalados: SIGSEGV SIGBUS SIGILL SIGABRT SIGTRAP SIGFPE");
 }
 
-// ---- handlers de terminate / unexpected (v08d) ----
+// ---- handler de terminate (v08e) ----
+//
+// std::set_terminate cobre:
+//   - excecao escapando de um noexcept
+//   - std::thread destruido sem join/detach
+//   - __cxa_pure_virtual
+//   - bad_alloc nao capturado
+//   - terminate() chamado explicitamente
+// Em todos esses casos, o handler loga a mensagem do what() via LogRaw
+// ANTES de chamar abort(). O runtime.log vai mostrar
+// "==== TERMINATE: <msg> ====".
 
 void TerminateHandler() {
     std::string msg = "(sem excecao ativa)";
@@ -304,11 +313,6 @@ void TerminateHandler() {
     LogRaw("==== TERMINATE: %s ====", msg.c_str());
     LogRaw("==== TERMINATE: chamando abort() (o processo vai morrer) ====");
     std::abort();
-}
-
-void UnexpectedHandler() {
-    LogRaw("==== UNEXPECTED: excecao fora de especificacao, chamando terminate ====");
-    std::terminate();
 }
 
 // ---- arena ----
@@ -465,8 +469,7 @@ void* BootThread(void* raw) {
         (unsigned long long)kImageGlobalsEnd);
 
     std::set_terminate(TerminateHandler);
-    std::set_unexpected(UnexpectedHandler);
-    Log("Handlers de terminate/unexpected instalados");
+    Log("Handler de terminate instalado");
 
     InstallSignalHandler();
     uint32_t entry = 0;
