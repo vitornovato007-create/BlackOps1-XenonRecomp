@@ -1,61 +1,24 @@
 // Runtime inicial do BO1 (Android ARM64).
 // So existe quando o C++ recompilado esta presente (BO1_HAVE_GENERATED).
 //
-// Correcoes de diagnostico (em relacao ao runtime.cpp original):
-//   - MapRegions() cobre 0x00000000..0x100000000 (arena inteira, 4 GB virtual)
-//   - g_fault* -> thread_local (FaultInfo)
-//   - SegvHandler loga signo, si_code, fault_addr, fault_address, PC+offset
-//     no .so (dladdr), r1/r2/r13/lr/sp do ucontext_t
-//   - Commit() loga cada regiao (guest inicio/fim, MB, host inicio/fim, ok/falha)
-//   - BootThread loga constantes do ppc_config.h e estado de r2/r13 antes do _xstart
-//   - InitFunctionTable e LoadXex logam contadores e secoes ignoradas
-//   - Trace loga lr tambem
-//   - Mensagens de erro no formato "==== ... ===="
-//
-// Correcao 2026-11-08a:
-//   - campo FaultInfo::si_addr renomeado para fault_addr (evita colisao com
-//     o macro `si_addr` de asm-generic/siginfo.h, que expande para
-//     `_sifields._sigfault._addr` e quebrava a compilacao com 5 erros).
-//   - `info->si_addr` no SegvHandler permanece intacto (ali o macro e o que
-//     acessa o campo real do siginfo_t).
-//
-// Correcao 2026-11-08b:
-//   - MapRegions() passa a commitar a arena INTEIRA (0x0..0x100000000).
-//     Antes commitava so imagem+globais (0x82000000..0xA0000000), heap
-//     (0x40000000..0x80000000) e fisica (0xA0000000..0xC0000000), deixando
-//     buracos nao mapeados (0x0..0x40000000, 0x80000000..0x82000000,
-//     0xC0000000..0x100000000). O primeiro SIGSEGV apos o boot anterior foi
-//     em fault_addr = g_base + 0x17 (guest 0x17), caindo no primeiro buraco.
-//     Como o mmap original usa MAP_NORESERVE, commitar 4 GB nao consome RAM
-//     fisica — so as paginas que o jogo tocar.
-//
-// Correcao 2026-11-08c (diagnostico de morte silenciosa):
-//   - InstallSignalHandler agora cobre SIGSEGV, SIGBUS, SIGILL, SIGABRT,
-//     SIGTRAP, SIGFPE. Antes so SIGSEGV/SIGBUS, entao UDF/abort/trap/div0
-//     matavam a thread sem log.
-//   - FaultInfo ganhou signo e si_code; a mensagem de falha comeca com
-//     "sinal=N si_code=M" para distinguir SEGV_MAPERR de ILL_ILLOPC de
-//     SI_TKILL (abort) etc.
-//   - LogRaw: escrita direta via write(2) no fd do log, sem g_logMutex.
-//     Usada no SegvHandler e no beat. Impede deadlock se uma thread morrer
-//     dentro de Log() segurando o mutex.
-//   - beat loga a cada 5s independente de g_state, e inclui segundos desde
-//     o ultimo import. Se o BootThread morrer, o beat continua logando e
-//     mostra "TRAVADO".
-//   - BootThread chama LogRaw("=== Fim") como fallback, alem de Log normal,
-//     para que o fim sempre apareca no arquivo mesmo se o mutex travar.
-//   - kPhysEnd subiu de 0xC0000000 (512 MB) para 0xC8000000 (640 MB) para
-//     dar folga ao BumpAlloc. Nao consome RAM fisica (bump e so ponteiro;
-//     paginas so viram RAM no primeiro acesso, demand paging do mmap
-//     MAP_NORESERVE).
-//   - Implementados: XGetVideoMode (preenche D3DVIDEO_MODE 1280x720x60),
-//     ExCreateThread (sucesso + thread vazia), NtDuplicateObject,
-//     NtCreateSemaphore, NtCreateMutant, NtClearEvent, RtlRaiseException,
-//     XamGetSystemVersion, RtlNtStatusToDosError, XMsgInProcessCall,
-//     XamAlloc, XamFree, XamLoaderGetLaunchData, XamLoaderSetLaunchData,
-//     XamLoaderLaunchTitle, NetDll_XNetStartup, NetDll_WSAStartup,
-//     XexCheckExecutablePrivilege, XexGetProcedureAddress, XexLoadImage,
-//     XexUnloadImage.
+// Historico de correcoes:
+//   2026-11-08a: si_addr -> fault_addr (colisao com macro do kernel)
+//   2026-11-08b: MapRegions cobre 0x0..0x100000000 (arena inteira)
+//   2026-11-08c: 6 sinais, LogRaw, beat a cada 5s, kPhysEnd 640MB,
+//                implementacao de XGetVideoMode, ExCreateThread, etc.
+//   2026-11-08d (esta):
+//     - std::set_terminate / std::set_unexpected: se uma excecao escapar
+//       ou std::thread for destruido sem join/detach, o runtime loga a
+//       causa via LogRaw ANTES de chamar abort(). O runtime.log vai mostrar
+//       "==== TERMINATE: <mensagem> ====".
+//     - beat.detach() em vez de beat.join(). Se RunGuest lançar ou
+//       abortar, o std::thread nao e destruido "joinable" (que causaria
+//       std::terminate -> abort).
+//     - RunGuest: se ocorrer SIGABRT/SIGILL/etc, o handler via
+//       siglongjmp cai no else, e o catch(...) do RunGuest captura
+//       std::exception para logar via LogRaw tambem.
+//     - Mensagens de "=== Fim" sempre via Log E LogRaw (redundancia
+//       para garantir que aparece mesmo se o FILE* estiver corrompido).
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -77,6 +40,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -98,14 +62,14 @@ uint8_t* g_base = nullptr;
 
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_stop{false};
-std::atomic<int>  g_state{0};          // 0=parado 1=executando 2=terminou 3=erro
-std::atomic<bool> g_finished{false};   // setado pelo RunGuest antes de sair
+std::atomic<int>  g_state{0};
+std::atomic<bool> g_finished{false};
 std::atomic<uint64_t> g_totalCalls{0};
-std::atomic<uint64_t> g_lastCallMs{0}; // ms desde epoch do ultimo import
+std::atomic<uint64_t> g_lastCallMs{0};
 
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
-int   g_logFd   = -1;                  // fd do log (usado por LogRaw)
+int   g_logFd   = -1;
 
 std::mutex g_stateMutex;
 std::string g_lastImport;
@@ -114,12 +78,11 @@ std::string g_endReason;
 std::mutex g_callsMutex;
 std::unordered_map<std::string,uint64_t> g_callCounts;
 
-// Diagnostico de falha. thread_local para nao contaminar entre threads.
 thread_local sigjmp_buf* t_jump = nullptr;
 
 struct FaultInfo {
-    uint64_t fault_addr    = 0;   // endereco acessado (do si_addr do kernel)
-    uint64_t fault_address = 0;   // do ucontext (redundante, mas util)
+    uint64_t fault_addr    = 0;
+    uint64_t fault_address = 0;
     uint64_t pc            = 0;
     uint64_t pc_so_offset  = 0;
     char     so_name[256]  = {0};
@@ -141,9 +104,8 @@ constexpr uint64_t kTableSize  = PPC_CODE_SIZE * 2;
 constexpr uint32_t kHeapStart = 0x40000000u;
 constexpr uint32_t kHeapEnd   = 0x80000000u;
 constexpr uint32_t kPhysStart = 0xA0000000u;
-constexpr uint32_t kPhysEnd   = 0xC8000000u;   // 640 MB (era 512 MB)
+constexpr uint32_t kPhysEnd   = 0xC8000000u;
 
-// Fim do range "imagem + globais" (so para classificacao no log).
 constexpr uint64_t kImageGlobalsEnd = 0xA0000000ull;
 
 struct Bump { uint32_t current; uint32_t end; };
@@ -153,8 +115,6 @@ Bump g_phys{kPhysStart, kPhysEnd};
 
 // ---- logging ----
 
-// Log normal: usa mutex + FILE*, formatado. Pode travar se o mutex estiver
-// travado por uma thread morta — use apenas fora do handler de sinal.
 void Log(const char* fmt, ...) {
     char text[2048];
     va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
@@ -163,18 +123,12 @@ void Log(const char* fmt, ...) {
     if (g_logFile) { fputs(text, g_logFile); fputc('\n', g_logFile); fflush(g_logFile); }
 }
 
-// LogRaw: sem mutex, escrita direta no fd. Segura para uso dentro do handler
-// de sinal e em threads que podem nao conseguir o g_logMutex (ex: beat).
-// Nao interage com FILE*, entao nao corrompe o stream do Log normal — as
-// escritas sao independentes (raw usa write(2) no mesmo fd; o FILE* tambem
-// aponta para o mesmo fd, mas o fflush garante ordem).
 void LogRaw(const char* fmt, ...) {
-    if (g_logFd < 0) return;
     char text[2048];
     va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
+    __android_log_print(ANDROID_LOG_INFO, "BO1", "%s", text);
+    if (g_logFd < 0) return;
     size_t n = strlen(text);
-    // Escreve uma linha inteira em uma unica write(2) (atomica para < PIPE_BUF,
-    // que e 4096 no Linux — nosso buffer e 2048, entao OK).
     char line[2100];
     size_t total = (n < sizeof(line)-2) ? n : sizeof(line)-2;
     memcpy(line, text, total);
@@ -182,7 +136,6 @@ void LogRaw(const char* fmt, ...) {
     line[total+1] = 0;
     ssize_t ignored = write(g_logFd, line, total+1);
     (void)ignored;
-    __android_log_print(ANDROID_LOG_INFO, "BO1", "%s", text);
 }
 
 uint64_t NowMs() {
@@ -252,10 +205,9 @@ void Trace(const char* name, PPCContext& ctx) {
     if (count > 20000000ull) throw BootStop{std::string("==== importacao em laco: ")+name+" ===="};
 }
 
-// ---- signal handler ----
+// ---- handlers de sinais ----
 
 void SegvHandler(int signo, siginfo_t* info, void* ucv) {
-    // Captura o tipo de sinal e o codigo. Nao usa Log (mutex) — usa LogRaw.
     t_fault.fault_addr = (uint64_t)(uintptr_t)info->si_addr;
     t_fault.fault_address = 0;
     t_fault.signo   = signo;
@@ -299,8 +251,6 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
         }
     }
 
-    // LogRaw imediato: nao depende de mutex, aparece mesmo se a thread
-    // estiver travada em Log() em outra thread.
     LogRaw("==== SINAL signo=%d si_code=%d addr=0x%llX pc=0x%llX lr=0x%llX ====",
            signo, t_fault.si_code,
            (unsigned long long)t_fault.fault_addr,
@@ -308,8 +258,6 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
            (unsigned long long)t_fault.lr);
 
     if (t_jump) siglongjmp(*t_jump, 1);
-    // Sem jump: mata o processo mesmo (nao deixa o Android continuar
-    // com estado inconsistente). _exit e seguro dentro de handler.
     _exit(139);
 }
 
@@ -318,7 +266,6 @@ void InstallSignalHandler() {
     sa.sa_sigaction = SegvHandler;
     sa.sa_flags = SA_SIGINFO|SA_NODEFER|SA_RESTART;
     sigemptyset(&sa.sa_mask);
-    // Bloqueia outros sinais enquanto o handler roda (evita reentrada).
     sigaddset(&sa.sa_mask, SIGSEGV);
     sigaddset(&sa.sa_mask, SIGBUS);
     sigaddset(&sa.sa_mask, SIGILL);
@@ -334,6 +281,37 @@ void InstallSignalHandler() {
     sigaction(SIGFPE, &sa,nullptr);
     Log("Sinais instalados: SIGSEGV SIGBUS SIGILL SIGABRT SIGTRAP SIGFPE");
 }
+
+// ---- handlers de terminate / unexpected (v08d) ----
+
+void TerminateHandler() {
+    std::string msg = "(sem excecao ativa)";
+    try {
+        std::exception_ptr ep = std::current_exception();
+        if (ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                msg = e.what();
+            } catch (const BootStop& b) {
+                msg = "BootStop: " + b.reason;
+            } catch (...) {
+                msg = "(excecao desconhecida)";
+            }
+        }
+    } catch (...) {}
+
+    LogRaw("==== TERMINATE: %s ====", msg.c_str());
+    LogRaw("==== TERMINATE: chamando abort() (o processo vai morrer) ====");
+    std::abort();
+}
+
+void UnexpectedHandler() {
+    LogRaw("==== UNEXPECTED: excecao fora de especificacao, chamando terminate ====");
+    std::terminate();
+}
+
+// ---- arena ----
 
 bool ReserveArena() {
     void* m = mmap(nullptr, kArenaSize+0x10000, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0);
@@ -351,7 +329,6 @@ bool ReserveArena() {
 }
 
 bool MapRegions() {
-    // Cobre a arena INTEIRA: 0x00000000..0x100000000 (4 GB virtual).
     if (!Commit(0, kArenaSize, "arena inteira")) return false;
     return true;
 }
@@ -389,9 +366,7 @@ bool LoadXex(const std::string& path, uint32_t& entry) {
 }
 
 void InitFunctionTable() {
-    size_t mapped = 0;
-    size_t skipped_guest = 0;
-    size_t skipped_null = 0;
+    size_t mapped = 0, skipped_guest = 0, skipped_null = 0;
     for (size_t i=0; PPCFuncMappings[i].guest!=0; i++) {
         uint64_t g = PPCFuncMappings[i].guest;
         if (!PPCFuncMappings[i].host) { skipped_null++; continue; }
@@ -473,8 +448,6 @@ struct StartArgs { std::string gameDir; std::string logPath; };
 void* BootThread(void* raw) {
     std::unique_ptr<StartArgs> args((StartArgs*)raw);
 
-    // Abre o log em DOIS canais: FILE* (para Log normal) e fd (para LogRaw
-    // no handler de sinal e no beat). Ambos apontam para o mesmo arquivo.
     g_logFile = fopen(args->logPath.c_str(), "w");
     g_logFd   = open(args->logPath.c_str(), O_WRONLY|O_CREAT|O_APPEND, 0644);
 
@@ -490,6 +463,10 @@ void* BootThread(void* raw) {
         (unsigned long long)kHeapStart, (unsigned long long)kHeapEnd,
         (unsigned long long)kPhysStart, (unsigned long long)kPhysEnd,
         (unsigned long long)kImageGlobalsEnd);
+
+    std::set_terminate(TerminateHandler);
+    std::set_unexpected(UnexpectedHandler);
+    Log("Handlers de terminate/unexpected instalados");
 
     InstallSignalHandler();
     uint32_t entry = 0;
@@ -544,10 +521,9 @@ void* BootThread(void* raw) {
     g_state = 1;
     g_lastCallMs.store(NowMs(), std::memory_order_relaxed);
 
-    // Beat: loga a cada 5s, INDEPENDENTE de g_state (para nao parar se
-    // alguma thread setar g_state errado). Usa LogRaw (sem mutex) para
-    // nao travar se uma thread morrer dentro do Log. Para quando o
-    // BootThread terminar (g_finished).
+    // beat.detach() (nao join): se RunGuest abortar, o std::thread nao e
+    // destruido "joinable" (o que causaria std::terminate -> abort).
+    // O beat roda ate ver g_finished (setado no fim de RunGuest).
     std::thread beat([](){
         while (!g_finished.load()) {
             for (int s=0; s<5 && !g_finished.load(); s++)
@@ -571,14 +547,12 @@ void* BootThread(void* raw) {
             }
         }
     });
+    beat.detach();
 
     RunGuest(fn, ctx);
-    beat.join();
 
     std::string reason;
     { std::lock_guard<std::mutex> lk(g_stateMutex); reason=g_endReason; }
-    // Log normal E LogRaw, para garantir que aparece mesmo se o mutex
-    // estiver travado.
     Log("=== Fim: %s ===", reason.c_str());
     LogRaw("=== Fim (raw): %s ===", reason.c_str());
     Log("Total de chamadas ao kernel: %llu", (unsigned long long)g_totalCalls.load());
@@ -688,7 +662,6 @@ PPC_FUNC(__imp__NtCreateMutant) {
 }
 PPC_FUNC(__imp__NtDuplicateObject) {
     Trace("NtDuplicateObject",ctx);
-    // Assinatura: (src_proc, src_handle, dst_proc, dst_handle_ptr, access, options)
     if (ctx.r5.u32) Put32(base,ctx.r5.u32,AllocHandle());
     ctx.r3.u64=0;
 }
@@ -701,10 +674,6 @@ PPC_FUNC(__imp__NtWaitForSingleObjectEx) { Trace("NtWaitForSingleObjectEx",ctx);
 
 PPC_FUNC(__imp__ExCreateThread) {
     Trace("ExCreateThread",ctx);
-    // Assinatura tipica: (out_handle, stack_size, start_routine, start_context, creation_flags)
-    // Retornamos sucesso e escrevemos um handle valido. A thread real (que
-    // rodaria codigo guest) nao e criada — o jogo que usa a thread sente,
-    // mas o boot nao trava.
     if (ctx.r3.u32) Put32(base,ctx.r3.u32,AllocHandle());
     ctx.r3.u64=0;
 }
@@ -730,7 +699,6 @@ PPC_FUNC(__imp__NtCreateFile) {
         }
     }
     Log("[arquivo] NtCreateFile: %s", path.c_str());
-    // STATUS_OBJECT_NAME_NOT_FOUND
     ctx.r3.u64=0xC0000034u;
 }
 
@@ -743,19 +711,14 @@ PPC_FUNC(__imp__KeBugCheckEx)         { Trace("KeBugCheckEx",ctx);         throw
 
 PPC_FUNC(__imp__XexCheckExecutablePrivilege) {
     Trace("XexCheckExecutablePrivilege",ctx);
-    ctx.r3.u64 = 1; // tem privilegio
+    ctx.r3.u64 = 1;
 }
 PPC_FUNC(__imp__XexLoadImage) {
     Trace("XexLoadImage",ctx);
-    // Nao carregamos modulos XEX externos. Retornamos STATUS_NOT_FOUND
-    // para o jogo tratar (ele trata e chama XexUnloadImage).
     ctx.r3.u64 = 0xC0000034u;
 }
 PPC_FUNC(__imp__XexGetProcedureAddress) {
     Trace("XexGetProcedureAddress",ctx);
-    // Assinatura: (handle, ordinal, out_addr). Escreve 0 em *out e retorna
-    // STATUS_ORDINAL_NOT_FOUND. O jogo tratou 0xC0000263 antes; mantemos
-    // o mesmo status para o fluxo seguir identico.
     if (ctx.r5.u32) Put32(base, ctx.r5.u32, 0);
     ctx.r3.u64 = 0xC0000263u;
 }
@@ -766,24 +729,22 @@ PPC_FUNC(__imp__XexUnloadImage) {
 PPC_FUNC(__imp__RtlNtStatusToDosError) {
     Trace("RtlNtStatusToDosError",ctx);
     uint32_t st = ctx.r3.u32;
-    uint32_t dos = 87; // ERROR_INVALID_PARAMETER
-    if (st == 0xC0000034u) dos = 2;   // ERROR_FILE_NOT_FOUND
-    else if (st == 0xC0000263u) dos = 2; // objeto nao encontrado -> file not found
-    else if (st == 0xC000007Fu) dos = 2; // ordinal nao encontrado
-    else if (st == 0xC0000001u) dos = 1; // ERROR_INVALID_FUNCTION
+    uint32_t dos = 87;
+    if (st == 0xC0000034u) dos = 2;
+    else if (st == 0xC0000263u) dos = 2;
+    else if (st == 0xC000007Fu) dos = 2;
+    else if (st == 0xC0000001u) dos = 1;
     else if (st == 0) dos = 0;
     ctx.r3.u64 = dos;
 }
 
 PPC_FUNC(__imp__XamGetSystemVersion) {
     Trace("XamGetSystemVersion",ctx);
-    // 2.0.17511.0 (versao comum de dashboard; so informativa).
     ctx.r3.u64 = 0x020044C70000ull;
 }
 
 PPC_FUNC(__imp__XamLoaderGetLaunchData) {
     Trace("XamLoaderGetLaunchData",ctx);
-    // Preenche 0x3E0 bytes com zeros (ja esta zerado pela arena) e retorna 0.
     ctx.r3.u64 = 0;
 }
 PPC_FUNC(__imp__XamLoaderSetLaunchData) {
@@ -799,20 +760,16 @@ PPC_FUNC(__imp__XamLoaderLaunchTitle) {
 
 PPC_FUNC(__imp__XGetVideoMode) {
     Trace("XGetVideoMode",ctx);
-    // D3DVIDEO_MODE (Xbox 360): width, height, refresh, flags...
-    // Estrutura minima: 0x00 width, 0x04 height, 0x08 refresh (Hz),
-    // 0x0C flags (bit 0 = widescreen), 0x10 is_interlaced, etc.
-    // Vamos preencher com 1280x720x60, widescreen.
     uint32_t p = ctx.r3.u32;
     if (p) {
         Put32(base, p+0x00, 1280);
         Put32(base, p+0x04, 720);
         Put32(base, p+0x08, 60);
-        Put32(base, p+0x0C, 0x1);  // widescreen
-        Put32(base, p+0x10, 0);    // progressive
-        Put32(base, p+0x14, 0);    // aspect
+        Put32(base, p+0x0C, 0x1);
+        Put32(base, p+0x10, 0);
+        Put32(base, p+0x14, 0);
     }
-    ctx.r3.u64 = 1; // sucesso
+    ctx.r3.u64 = 1;
 }
 
 PPC_FUNC(__imp__XMsgInProcessCall) {
