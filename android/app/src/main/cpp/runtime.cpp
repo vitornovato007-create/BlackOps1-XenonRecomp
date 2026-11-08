@@ -2,7 +2,7 @@
 // So existe quando o C++ recompilado esta presente (BO1_HAVE_GENERATED).
 //
 // Correcoes de diagnostico (em relacao ao runtime.cpp original):
-//   - MapRegions() cobre 0x82000000..0xA0000000 (imagem+globais) de uma vez
+//   - MapRegions() cobre 0x00000000..0x100000000 (arena inteira, 4 GB virtual)
 //   - g_fault* -> thread_local (FaultInfo)
 //   - SegvHandler loga fault_addr, fault_address, PC+offset no .so (dladdr),
 //     r1/r2/r13/lr/sp do ucontext_t
@@ -12,12 +12,22 @@
 //   - Trace loga lr tambem
 //   - Mensagens de erro no formato "==== ... ===="
 //
-// Correcao 2026-11-08:
+// Correcao 2026-11-08a:
 //   - campo FaultInfo::si_addr renomeado para fault_addr (evita colisao com
 //     o macro `si_addr` de asm-generic/siginfo.h, que expande para
 //     `_sifields._sigfault._addr` e quebrava a compilacao com 5 erros).
 //   - `info->si_addr` no SegvHandler permanece intacto (ali o macro e o que
 //     acessa o campo real do siginfo_t).
+//
+// Correcao 2026-11-08b:
+//   - MapRegions() passa a commitar a arena INTEIRA (0x0..0x100000000).
+//     Antes commitava so imagem+globais (0x82000000..0xA0000000), heap
+//     (0x40000000..0x80000000) e fisica (0xA0000000..0xC0000000), deixando
+//     buracos nao mapeados (0x0..0x40000000, 0x80000000..0x82000000,
+//     0xC0000000..0x100000000). O primeiro SIGSEGV apos o boot anterior foi
+//     em fault_addr = g_base + 0x17 (guest 0x17), caindo no primeiro buraco.
+//     Como o mmap original usa MAP_NORESERVE, commitar 4 GB nao consome RAM
+//     fisica — so as paginas que o jogo tocar.
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -246,14 +256,12 @@ bool ReserveArena() {
 }
 
 bool MapRegions() {
-    // 1) Imagem + globais: 0x82000000..0xA0000000 (480 MB virtual).
-    //    Cobre imagem, tabela e TODA a faixa "system memory" do jogo
-    //    (0x83FE8508, 0x93010100, etc.).
-    if (!Commit(PPC_IMAGE_BASE, kImageGlobalsEnd - PPC_IMAGE_BASE, "imagem+globais")) return false;
-    // 2) Heap: 0x40000000..0x80000000 (1 GB)
-    if (!Commit(kHeapStart, kHeapEnd - kHeapStart, "heap")) return false;
-    // 3) Fisica: 0xA0000000..0xC0000000 (512 MB)
-    if (!Commit(kPhysStart, kPhysEnd - kPhysStart, "fisica")) return false;
+    // Cobre a arena INTEIRA: 0x00000000..0x100000000 (4 GB virtual).
+    // Como o mmap original usa MAP_NORESERVE, isso NAO consome RAM fisica —
+    // so as paginas que o jogo tocar de fato. Elimina a classe inteira de
+    // SIGSEGV por "endereco guest dentro da arena mas fora das 3 faixas
+    // commitadas" (ex: g_base+0x17, g_base+0x80000000, etc.).
+    if (!Commit(0, kArenaSize, "arena inteira")) return false;
     return true;
 }
 
