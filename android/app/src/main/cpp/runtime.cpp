@@ -4,8 +4,8 @@
 // Correcoes de diagnostico (em relacao ao runtime.cpp original):
 //   - MapRegions() cobre 0x00000000..0x100000000 (arena inteira, 4 GB virtual)
 //   - g_fault* -> thread_local (FaultInfo)
-//   - SegvHandler loga fault_addr, fault_address, PC+offset no .so (dladdr),
-//     r1/r2/r13/lr/sp do ucontext_t
+//   - SegvHandler loga signo, si_code, fault_addr, fault_address, PC+offset
+//     no .so (dladdr), r1/r2/r13/lr/sp do ucontext_t
 //   - Commit() loga cada regiao (guest inicio/fim, MB, host inicio/fim, ok/falha)
 //   - BootThread loga constantes do ppc_config.h e estado de r2/r13 antes do _xstart
 //   - InitFunctionTable e LoadXex logam contadores e secoes ignoradas
@@ -28,6 +28,34 @@
 //     em fault_addr = g_base + 0x17 (guest 0x17), caindo no primeiro buraco.
 //     Como o mmap original usa MAP_NORESERVE, commitar 4 GB nao consome RAM
 //     fisica — so as paginas que o jogo tocar.
+//
+// Correcao 2026-11-08c (diagnostico de morte silenciosa):
+//   - InstallSignalHandler agora cobre SIGSEGV, SIGBUS, SIGILL, SIGABRT,
+//     SIGTRAP, SIGFPE. Antes so SIGSEGV/SIGBUS, entao UDF/abort/trap/div0
+//     matavam a thread sem log.
+//   - FaultInfo ganhou signo e si_code; a mensagem de falha comeca com
+//     "sinal=N si_code=M" para distinguir SEGV_MAPERR de ILL_ILLOPC de
+//     SI_TKILL (abort) etc.
+//   - LogRaw: escrita direta via write(2) no fd do log, sem g_logMutex.
+//     Usada no SegvHandler e no beat. Impede deadlock se uma thread morrer
+//     dentro de Log() segurando o mutex.
+//   - beat loga a cada 5s independente de g_state, e inclui segundos desde
+//     o ultimo import. Se o BootThread morrer, o beat continua logando e
+//     mostra "TRAVADO".
+//   - BootThread chama LogRaw("=== Fim") como fallback, alem de Log normal,
+//     para que o fim sempre apareca no arquivo mesmo se o mutex travar.
+//   - kPhysEnd subiu de 0xC0000000 (512 MB) para 0xC8000000 (640 MB) para
+//     dar folga ao BumpAlloc. Nao consome RAM fisica (bump e so ponteiro;
+//     paginas so viram RAM no primeiro acesso, demand paging do mmap
+//     MAP_NORESERVE).
+//   - Implementados: XGetVideoMode (preenche D3DVIDEO_MODE 1280x720x60),
+//     ExCreateThread (sucesso + thread vazia), NtDuplicateObject,
+//     NtCreateSemaphore, NtCreateMutant, NtClearEvent, RtlRaiseException,
+//     XamGetSystemVersion, RtlNtStatusToDosError, XMsgInProcessCall,
+//     XamAlloc, XamFree, XamLoaderGetLaunchData, XamLoaderSetLaunchData,
+//     XamLoaderLaunchTitle, NetDll_XNetStartup, NetDll_WSAStartup,
+//     XexCheckExecutablePrivilege, XexGetProcedureAddress, XexLoadImage,
+//     XexUnloadImage.
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -41,6 +69,7 @@
 #include <ucontext.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 
 #include <algorithm>
 #include <atomic>
@@ -69,11 +98,14 @@ uint8_t* g_base = nullptr;
 
 std::atomic<bool> g_started{false};
 std::atomic<bool> g_stop{false};
-std::atomic<int>  g_state{0};
+std::atomic<int>  g_state{0};          // 0=parado 1=executando 2=terminou 3=erro
+std::atomic<bool> g_finished{false};   // setado pelo RunGuest antes de sair
 std::atomic<uint64_t> g_totalCalls{0};
+std::atomic<uint64_t> g_lastCallMs{0}; // ms desde epoch do ultimo import
 
 std::mutex g_logMutex;
 FILE* g_logFile = nullptr;
+int   g_logFd   = -1;                  // fd do log (usado por LogRaw)
 
 std::mutex g_stateMutex;
 std::string g_lastImport;
@@ -82,13 +114,12 @@ std::string g_endReason;
 std::mutex g_callsMutex;
 std::unordered_map<std::string,uint64_t> g_callCounts;
 
-// Diagnostico de falha. thread_local para nao contaminar entre threads
-// (BootThread e beat rodam em paralelo).
+// Diagnostico de falha. thread_local para nao contaminar entre threads.
 thread_local sigjmp_buf* t_jump = nullptr;
 
 struct FaultInfo {
-    uint64_t fault_addr    = 0;   // renomeado de si_addr (colide com macro do kernel)
-    uint64_t fault_address = 0;
+    uint64_t fault_addr    = 0;   // endereco acessado (do si_addr do kernel)
+    uint64_t fault_address = 0;   // do ucontext (redundante, mas util)
     uint64_t pc            = 0;
     uint64_t pc_so_offset  = 0;
     char     so_name[256]  = {0};
@@ -98,6 +129,8 @@ struct FaultInfo {
     uint64_t r13           = 0;
     uint64_t lr            = 0;
     uint64_t sp            = 0;
+    int      signo         = 0;
+    int      si_code       = 0;
 };
 thread_local FaultInfo t_fault{};
 
@@ -108,9 +141,9 @@ constexpr uint64_t kTableSize  = PPC_CODE_SIZE * 2;
 constexpr uint32_t kHeapStart = 0x40000000u;
 constexpr uint32_t kHeapEnd   = 0x80000000u;
 constexpr uint32_t kPhysStart = 0xA0000000u;
-constexpr uint32_t kPhysEnd   = 0xC0000000u;
+constexpr uint32_t kPhysEnd   = 0xC8000000u;   // 640 MB (era 512 MB)
 
-// Fim do range "imagem + globais" que commitamos de uma vez.
+// Fim do range "imagem + globais" (so para classificacao no log).
 constexpr uint64_t kImageGlobalsEnd = 0xA0000000ull;
 
 struct Bump { uint32_t current; uint32_t end; };
@@ -118,6 +151,10 @@ std::mutex g_memMutex;
 Bump g_heap{kHeapStart, kHeapEnd};
 Bump g_phys{kPhysStart, kPhysEnd};
 
+// ---- logging ----
+
+// Log normal: usa mutex + FILE*, formatado. Pode travar se o mutex estiver
+// travado por uma thread morta — use apenas fora do handler de sinal.
 void Log(const char* fmt, ...) {
     char text[2048];
     va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
@@ -125,6 +162,35 @@ void Log(const char* fmt, ...) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     if (g_logFile) { fputs(text, g_logFile); fputc('\n', g_logFile); fflush(g_logFile); }
 }
+
+// LogRaw: sem mutex, escrita direta no fd. Segura para uso dentro do handler
+// de sinal e em threads que podem nao conseguir o g_logMutex (ex: beat).
+// Nao interage com FILE*, entao nao corrompe o stream do Log normal — as
+// escritas sao independentes (raw usa write(2) no mesmo fd; o FILE* tambem
+// aponta para o mesmo fd, mas o fflush garante ordem).
+void LogRaw(const char* fmt, ...) {
+    if (g_logFd < 0) return;
+    char text[2048];
+    va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
+    size_t n = strlen(text);
+    // Escreve uma linha inteira em uma unica write(2) (atomica para < PIPE_BUF,
+    // que e 4096 no Linux — nosso buffer e 2048, entao OK).
+    char line[2100];
+    size_t total = (n < sizeof(line)-2) ? n : sizeof(line)-2;
+    memcpy(line, text, total);
+    line[total] = '\n';
+    line[total+1] = 0;
+    ssize_t ignored = write(g_logFd, line, total+1);
+    (void)ignored;
+    __android_log_print(ANDROID_LOG_INFO, "BO1", "%s", text);
+}
+
+uint64_t NowMs() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+// ---- helpers ----
 
 uint32_t Get32(const uint8_t* b, uint32_t a) { uint32_t v; memcpy(&v,b+a,4); return __builtin_bswap32(v); }
 uint16_t Get16(const uint8_t* b, uint32_t a) { uint16_t v; memcpy(&v,b+a,2); return __builtin_bswap16(v); }
@@ -172,6 +238,7 @@ bool Commit(uint64_t guest, uint64_t size, const char* what) {
 void Trace(const char* name, PPCContext& ctx) {
     if (g_stop.load()) throw BootStop{"parado pelo usuario"};
     uint64_t total = ++g_totalCalls;
+    g_lastCallMs.store(NowMs(), std::memory_order_relaxed);
     uint64_t count;
     { std::lock_guard<std::mutex> lk(g_callsMutex); count = ++g_callCounts[name]; }
     { std::lock_guard<std::mutex> lk(g_stateMutex); g_lastImport = name; }
@@ -185,11 +252,14 @@ void Trace(const char* name, PPCContext& ctx) {
     if (count > 20000000ull) throw BootStop{std::string("==== importacao em laco: ")+name+" ===="};
 }
 
-void SegvHandler(int, siginfo_t* info, void* ucv) {
-    // info->si_addr permanece como macro do kernel (correto para siginfo_t*).
-    // O membro da nossa struct se chama fault_addr para nao colidir.
+// ---- signal handler ----
+
+void SegvHandler(int signo, siginfo_t* info, void* ucv) {
+    // Captura o tipo de sinal e o codigo. Nao usa Log (mutex) — usa LogRaw.
     t_fault.fault_addr = (uint64_t)(uintptr_t)info->si_addr;
     t_fault.fault_address = 0;
+    t_fault.signo   = signo;
+    t_fault.si_code = info ? info->si_code : 0;
 
     ucontext_t* uc = (ucontext_t*)ucv;
 #if defined(__aarch64__)
@@ -229,15 +299,40 @@ void SegvHandler(int, siginfo_t* info, void* ucv) {
         }
     }
 
+    // LogRaw imediato: nao depende de mutex, aparece mesmo se a thread
+    // estiver travada em Log() em outra thread.
+    LogRaw("==== SINAL signo=%d si_code=%d addr=0x%llX pc=0x%llX lr=0x%llX ====",
+           signo, t_fault.si_code,
+           (unsigned long long)t_fault.fault_addr,
+           (unsigned long long)t_fault.pc,
+           (unsigned long long)t_fault.lr);
+
     if (t_jump) siglongjmp(*t_jump, 1);
+    // Sem jump: mata o processo mesmo (nao deixa o Android continuar
+    // com estado inconsistente). _exit e seguro dentro de handler.
     _exit(139);
 }
 
 void InstallSignalHandler() {
     struct sigaction sa; memset(&sa,0,sizeof(sa));
-    sa.sa_sigaction = SegvHandler; sa.sa_flags = SA_SIGINFO|SA_NODEFER;
+    sa.sa_sigaction = SegvHandler;
+    sa.sa_flags = SA_SIGINFO|SA_NODEFER|SA_RESTART;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV,&sa,nullptr); sigaction(SIGBUS,&sa,nullptr);
+    // Bloqueia outros sinais enquanto o handler roda (evita reentrada).
+    sigaddset(&sa.sa_mask, SIGSEGV);
+    sigaddset(&sa.sa_mask, SIGBUS);
+    sigaddset(&sa.sa_mask, SIGILL);
+    sigaddset(&sa.sa_mask, SIGABRT);
+    sigaddset(&sa.sa_mask, SIGTRAP);
+    sigaddset(&sa.sa_mask, SIGFPE);
+
+    sigaction(SIGSEGV,&sa,nullptr);
+    sigaction(SIGBUS, &sa,nullptr);
+    sigaction(SIGILL, &sa,nullptr);
+    sigaction(SIGABRT,&sa,nullptr);
+    sigaction(SIGTRAP,&sa,nullptr);
+    sigaction(SIGFPE, &sa,nullptr);
+    Log("Sinais instalados: SIGSEGV SIGBUS SIGILL SIGABRT SIGTRAP SIGFPE");
 }
 
 bool ReserveArena() {
@@ -257,10 +352,6 @@ bool ReserveArena() {
 
 bool MapRegions() {
     // Cobre a arena INTEIRA: 0x00000000..0x100000000 (4 GB virtual).
-    // Como o mmap original usa MAP_NORESERVE, isso NAO consome RAM fisica —
-    // so as paginas que o jogo tocar de fato. Elimina a classe inteira de
-    // SIGSEGV por "endereco guest dentro da arena mas fora das 3 faixas
-    // commitadas" (ex: g_base+0x17, g_base+0x80000000, etc.).
     if (!Commit(0, kArenaSize, "arena inteira")) return false;
     return true;
 }
@@ -329,6 +420,9 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(g_stateMutex);
             g_endReason = std::string("==== excecao: ")+e.what()+" ===="; g_state = 3;
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            g_endReason = "==== excecao desconhecida ===="; g_state = 3;
         }
     } else {
         uint64_t fault      = t_fault.fault_addr;
@@ -347,14 +441,17 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
             region = "heap"; rel = fault - kHeapStart;
         } else if (fault >= kPhysStart && fault < kPhysEnd) {
             region = "fisica"; rel = fault - kPhysStart;
+        } else if (fault >= 0 && fault < kArenaSize) {
+            region = "arena (outra faixa)"; rel = fault;
         }
 
-        char text[1024];
+        char text[1400];
         snprintf(text, sizeof(text),
-            "==== falha de memoria: fault_addr=0x%llX fault_address=0x%llX "
+            "==== falha: sinal=%d si_code=%d fault_addr=0x%llX fault_address=0x%llX "
             "regiao=%s(+0x%llX) PC_abs=0x%llX PC_so=+0x%llX so=%s sym=%s "
             "r1=0x%llX r2=0x%llX r13=0x%llX lr=0x%llX sp=0x%llX "
             "base_host=0x%llX ultima_funcao='%s' ====",
+            t_fault.signo, t_fault.si_code,
             (unsigned long long)fault, (unsigned long long)fault_arm,
             region, (unsigned long long)rel,
             (unsigned long long)pc, (unsigned long long)pc_off, so, sym,
@@ -367,6 +464,7 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
         g_endReason = text;
         g_state = 3;
     }
+    g_finished.store(true);
     t_jump = nullptr;
 }
 
@@ -374,10 +472,14 @@ struct StartArgs { std::string gameDir; std::string logPath; };
 
 void* BootThread(void* raw) {
     std::unique_ptr<StartArgs> args((StartArgs*)raw);
+
+    // Abre o log em DOIS canais: FILE* (para Log normal) e fd (para LogRaw
+    // no handler de sinal e no beat). Ambos apontam para o mesmo arquivo.
     g_logFile = fopen(args->logPath.c_str(), "w");
+    g_logFd   = open(args->logPath.c_str(), O_WRONLY|O_CREAT|O_APPEND, 0644);
+
     Log("=== BO1 runtime inicial ===");
     Log("Pasta: %s", args->gameDir.c_str());
-
     Log("ppc_config.h: PPC_IMAGE_BASE=0x%llX PPC_IMAGE_SIZE=0x%llX",
         (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
     Log("ppc_config.h: PPC_CODE_BASE=0x%llX PPC_CODE_SIZE=0x%llX",
@@ -394,14 +496,20 @@ void* BootThread(void* raw) {
     bool ok = ReserveArena() && MapRegions() && LoadXex(args->gameDir+"/default.xex", entry);
     if (!ok) {
         std::lock_guard<std::mutex> lk(g_stateMutex);
-        g_endReason = "==== falha na preparacao ===="; g_state = 3; return nullptr;
+        g_endReason = "==== falha na preparacao ===="; g_state = 3;
+        LogRaw("=== Fim: %s ===", g_endReason.c_str());
+        g_finished.store(true);
+        return nullptr;
     }
     InitFunctionTable();
     PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, entry);
     if (!fn) {
         Log("==== ERRO: entrada 0x%X sem funcao recompilada ====", entry);
         std::lock_guard<std::mutex> lk(g_stateMutex);
-        g_endReason = "==== entrada sem funcao recompilada ===="; g_state = 3; return nullptr;
+        g_endReason = "==== entrada sem funcao recompilada ===="; g_state = 3;
+        LogRaw("=== Fim: %s ===", g_endReason.c_str());
+        g_finished.store(true);
+        return nullptr;
     }
     uint32_t stack  = BumpAlloc(g_heap, 8*1024*1024, 0x10000);
     uint32_t pcr    = BumpAlloc(g_heap, 0x1000, 0x1000);
@@ -410,7 +518,10 @@ void* BootThread(void* raw) {
         Log("==== ERRO: sem memoria para a pilha (stack=0x%X pcr=0x%X thread=0x%X) ====",
             stack, pcr, thread);
         std::lock_guard<std::mutex> lk(g_stateMutex);
-        g_endReason = "==== sem memoria para a pilha ===="; g_state = 3; return nullptr;
+        g_endReason = "==== sem memoria para a pilha ===="; g_state = 3;
+        LogRaw("=== Fim: %s ===", g_endReason.c_str());
+        g_finished.store(true);
+        return nullptr;
     }
     Put32(g_base, pcr+256, thread);
     g_base[pcr+268] = 0;
@@ -431,23 +542,45 @@ void* BootThread(void* raw) {
 
     Log("Chamando a entrada do jogo...");
     g_state = 1;
+    g_lastCallMs.store(NowMs(), std::memory_order_relaxed);
+
+    // Beat: loga a cada 5s, INDEPENDENTE de g_state (para nao parar se
+    // alguma thread setar g_state errado). Usa LogRaw (sem mutex) para
+    // nao travar se uma thread morrer dentro do Log. Para quando o
+    // BootThread terminar (g_finished).
     std::thread beat([](){
-        while (g_state.load()==1) {
-            for (int s=0;s<10&&g_state.load()==1;s++)
+        while (!g_finished.load()) {
+            for (int s=0; s<5 && !g_finished.load(); s++)
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (g_state.load()==1) {
-                std::string last;
-                { std::lock_guard<std::mutex> lk(g_stateMutex); last=g_lastImport; }
-                Log("[ainda executando] chamadas: %llu ultima: %s",
-                    (unsigned long long)g_totalCalls.load(), last.c_str());
+            if (g_finished.load()) break;
+            uint64_t last = g_lastCallMs.load(std::memory_order_relaxed);
+            uint64_t now  = NowMs();
+            uint64_t secs = (now > last) ? (now - last)/1000ull : 0;
+            std::string imp;
+            { std::lock_guard<std::mutex> lk(g_stateMutex); imp = g_lastImport; }
+            if (secs >= 30) {
+                LogRaw("[TRAVADO] %llu s sem import · chamadas: %llu ultima: '%s'",
+                       (unsigned long long)secs,
+                       (unsigned long long)g_totalCalls.load(),
+                       imp.c_str());
+            } else {
+                LogRaw("[beat] %llu s desde ultimo import · chamadas: %llu ultima: '%s'",
+                       (unsigned long long)secs,
+                       (unsigned long long)g_totalCalls.load(),
+                       imp.c_str());
             }
         }
     });
+
     RunGuest(fn, ctx);
     beat.join();
+
     std::string reason;
     { std::lock_guard<std::mutex> lk(g_stateMutex); reason=g_endReason; }
+    // Log normal E LogRaw, para garantir que aparece mesmo se o mutex
+    // estiver travado.
     Log("=== Fim: %s ===", reason.c_str());
+    LogRaw("=== Fim (raw): %s ===", reason.c_str());
     Log("Total de chamadas ao kernel: %llu", (unsigned long long)g_totalCalls.load());
     {
         std::lock_guard<std::mutex> lk(g_callsMutex);
@@ -464,6 +597,13 @@ std::mutex g_tlsMutex;
 uint32_t g_tlsNext = 0;
 uint32_t g_tlsValues[256];
 uint32_t g_nextHandle = 0x1000;
+
+uint32_t AllocHandle() {
+    std::lock_guard<std::mutex> lk(g_tlsMutex);
+    uint32_t h = g_nextHandle;
+    g_nextHandle += 4;
+    return h;
+}
 
 } // namespace
 
@@ -503,7 +643,14 @@ PPC_FUNC(__imp__NtAllocateVirtualMemory) {
     Put32(base,ap,r); Put32(base,sp,(s+0xFFF)&~0xFFFu); ctx.r3.u64=0;
 }
 PPC_FUNC(__imp__NtFreeVirtualMemory)       { Trace("NtFreeVirtualMemory",ctx);       ctx.r3.u64=0; }
-PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx){ Trace("MmAllocatePhysicalMemoryEx",ctx); uint32_t al=ctx.r8.u32; ctx.r3.u64=BumpAlloc(g_phys,ctx.r4.u32,al?al:0x1000); }
+PPC_FUNC(__imp__MmAllocatePhysicalMemoryEx){
+    Trace("MmAllocatePhysicalMemoryEx",ctx);
+    uint32_t al=ctx.r8.u32;
+    uint32_t r=BumpAlloc(g_phys,ctx.r4.u32,al?al:0x1000);
+    if (!r) LogRaw("[aviso] MmAllocatePhysicalMemoryEx size=0x%X al=0x%X -> FALHOU (bump cheio)",
+                   ctx.r4.u32, al);
+    ctx.r3.u64=r;
+}
 PPC_FUNC(__imp__MmFreePhysicalMemory)      { Trace("MmFreePhysicalMemory",ctx); }
 PPC_FUNC(__imp__MmGetPhysicalAddress)      { Trace("MmGetPhysicalAddress",ctx);       ctx.r3.u64=ctx.r3.u32&0x1FFFFFFFu; }
 PPC_FUNC(__imp__MmQueryAddressProtect)     { Trace("MmQueryAddressProtect",ctx);      ctx.r3.u64=4; }
@@ -526,18 +673,51 @@ PPC_FUNC(__imp__RtlInitUnicodeString) {
 
 PPC_FUNC(__imp__NtCreateEvent) {
     Trace("NtCreateEvent",ctx);
-    if (ctx.r3.u32) { std::lock_guard<std::mutex> lk(g_tlsMutex); Put32(base,ctx.r3.u32,g_nextHandle); g_nextHandle+=4; }
+    if (ctx.r3.u32) Put32(base,ctx.r3.u32,AllocHandle());
+    ctx.r3.u64=0;
+}
+PPC_FUNC(__imp__NtCreateSemaphore) {
+    Trace("NtCreateSemaphore",ctx);
+    if (ctx.r3.u32) Put32(base,ctx.r3.u32,AllocHandle());
+    ctx.r3.u64=0;
+}
+PPC_FUNC(__imp__NtCreateMutant) {
+    Trace("NtCreateMutant",ctx);
+    if (ctx.r3.u32) Put32(base,ctx.r3.u32,AllocHandle());
+    ctx.r3.u64=0;
+}
+PPC_FUNC(__imp__NtDuplicateObject) {
+    Trace("NtDuplicateObject",ctx);
+    // Assinatura: (src_proc, src_handle, dst_proc, dst_handle_ptr, access, options)
+    if (ctx.r5.u32) Put32(base,ctx.r5.u32,AllocHandle());
     ctx.r3.u64=0;
 }
 PPC_FUNC(__imp__NtSetEvent)              { Trace("NtSetEvent",ctx);              ctx.r3.u64=0; }
+PPC_FUNC(__imp__NtClearEvent)            { Trace("NtClearEvent",ctx);            ctx.r3.u64=0; }
 PPC_FUNC(__imp__KeSetEvent)              { Trace("KeSetEvent",ctx);              ctx.r3.u64=0; }
 PPC_FUNC(__imp__KeResetEvent)            { Trace("KeResetEvent",ctx);            ctx.r3.u64=0; }
 PPC_FUNC(__imp__KeWaitForSingleObject)   { Trace("KeWaitForSingleObject",ctx);   ctx.r3.u64=0; }
 PPC_FUNC(__imp__NtWaitForSingleObjectEx) { Trace("NtWaitForSingleObjectEx",ctx); ctx.r3.u64=0; }
 
-PPC_FUNC(__imp__ExCreateThread)         { Trace("ExCreateThread",ctx);         ctx.r3.u64=0xC0000001u; }
+PPC_FUNC(__imp__ExCreateThread) {
+    Trace("ExCreateThread",ctx);
+    // Assinatura tipica: (out_handle, stack_size, start_routine, start_context, creation_flags)
+    // Retornamos sucesso e escrevemos um handle valido. A thread real (que
+    // rodaria codigo guest) nao e criada — o jogo que usa a thread sente,
+    // mas o boot nao trava.
+    if (ctx.r3.u32) Put32(base,ctx.r3.u32,AllocHandle());
+    ctx.r3.u64=0;
+}
 PPC_FUNC(__imp__KeSetAffinityThread)    { Trace("KeSetAffinityThread",ctx);    ctx.r3.u64=0; }
 PPC_FUNC(__imp__KeSetBasePriorityThread){ Trace("KeSetBasePriorityThread",ctx); ctx.r3.u64=0; }
+
+PPC_FUNC(__imp__RtlRaiseException) {
+    Trace("RtlRaiseException",ctx);
+    uint32_t code = 0;
+    if (ctx.r3.u32) code = Get32(base, ctx.r3.u32);
+    LogRaw("[exception] RtlRaiseException code=0x%X (ignorando)", code);
+    ctx.r3.u64=0;
+}
 
 PPC_FUNC(__imp__NtCreateFile) {
     Trace("NtCreateFile",ctx);
@@ -550,6 +730,7 @@ PPC_FUNC(__imp__NtCreateFile) {
         }
     }
     Log("[arquivo] NtCreateFile: %s", path.c_str());
+    // STATUS_OBJECT_NAME_NOT_FOUND
     ctx.r3.u64=0xC0000034u;
 }
 
@@ -557,6 +738,99 @@ PPC_FUNC(__imp__DbgPrint)             { Trace("DbgPrint",ctx); Log("[DbgPrint] %
 PPC_FUNC(__imp__HalReturnToFirmware)  { Trace("HalReturnToFirmware",ctx);  throw BootStop{"==== o jogo chamou HalReturnToFirmware ===="}; }
 PPC_FUNC(__imp__KeBugCheck)           { Trace("KeBugCheck",ctx);           throw BootStop{"==== o jogo chamou KeBugCheck ===="}; }
 PPC_FUNC(__imp__KeBugCheckEx)         { Trace("KeBugCheckEx",ctx);         throw BootStop{"==== o jogo chamou KeBugCheckEx ===="}; }
+
+// --- XAM / XEX / XNET ---
+
+PPC_FUNC(__imp__XexCheckExecutablePrivilege) {
+    Trace("XexCheckExecutablePrivilege",ctx);
+    ctx.r3.u64 = 1; // tem privilegio
+}
+PPC_FUNC(__imp__XexLoadImage) {
+    Trace("XexLoadImage",ctx);
+    // Nao carregamos modulos XEX externos. Retornamos STATUS_NOT_FOUND
+    // para o jogo tratar (ele trata e chama XexUnloadImage).
+    ctx.r3.u64 = 0xC0000034u;
+}
+PPC_FUNC(__imp__XexGetProcedureAddress) {
+    Trace("XexGetProcedureAddress",ctx);
+    // Assinatura: (handle, ordinal, out_addr). Escreve 0 em *out e retorna
+    // STATUS_ORDINAL_NOT_FOUND. O jogo tratou 0xC0000263 antes; mantemos
+    // o mesmo status para o fluxo seguir identico.
+    if (ctx.r5.u32) Put32(base, ctx.r5.u32, 0);
+    ctx.r3.u64 = 0xC0000263u;
+}
+PPC_FUNC(__imp__XexUnloadImage) {
+    Trace("XexUnloadImage",ctx);
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__RtlNtStatusToDosError) {
+    Trace("RtlNtStatusToDosError",ctx);
+    uint32_t st = ctx.r3.u32;
+    uint32_t dos = 87; // ERROR_INVALID_PARAMETER
+    if (st == 0xC0000034u) dos = 2;   // ERROR_FILE_NOT_FOUND
+    else if (st == 0xC0000263u) dos = 2; // objeto nao encontrado -> file not found
+    else if (st == 0xC000007Fu) dos = 2; // ordinal nao encontrado
+    else if (st == 0xC0000001u) dos = 1; // ERROR_INVALID_FUNCTION
+    else if (st == 0) dos = 0;
+    ctx.r3.u64 = dos;
+}
+
+PPC_FUNC(__imp__XamGetSystemVersion) {
+    Trace("XamGetSystemVersion",ctx);
+    // 2.0.17511.0 (versao comum de dashboard; so informativa).
+    ctx.r3.u64 = 0x020044C70000ull;
+}
+
+PPC_FUNC(__imp__XamLoaderGetLaunchData) {
+    Trace("XamLoaderGetLaunchData",ctx);
+    // Preenche 0x3E0 bytes com zeros (ja esta zerado pela arena) e retorna 0.
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__XamLoaderSetLaunchData) {
+    Trace("XamLoaderSetLaunchData",ctx);
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__XamLoaderLaunchTitle) {
+    Trace("XamLoaderLaunchTitle",ctx);
+    LogRaw("[XamLoader] LaunchTitle chamado (r3=0x%X r4=0x%X) — retornando sucesso sem efeito real",
+           ctx.r3.u32, ctx.r4.u32);
+    ctx.r3.u64 = 0;
+}
+
+PPC_FUNC(__imp__XGetVideoMode) {
+    Trace("XGetVideoMode",ctx);
+    // D3DVIDEO_MODE (Xbox 360): width, height, refresh, flags...
+    // Estrutura minima: 0x00 width, 0x04 height, 0x08 refresh (Hz),
+    // 0x0C flags (bit 0 = widescreen), 0x10 is_interlaced, etc.
+    // Vamos preencher com 1280x720x60, widescreen.
+    uint32_t p = ctx.r3.u32;
+    if (p) {
+        Put32(base, p+0x00, 1280);
+        Put32(base, p+0x04, 720);
+        Put32(base, p+0x08, 60);
+        Put32(base, p+0x0C, 0x1);  // widescreen
+        Put32(base, p+0x10, 0);    // progressive
+        Put32(base, p+0x14, 0);    // aspect
+    }
+    ctx.r3.u64 = 1; // sucesso
+}
+
+PPC_FUNC(__imp__XMsgInProcessCall) {
+    Trace("XMsgInProcessCall",ctx);
+    ctx.r3.u64 = 0;
+}
+PPC_FUNC(__imp__XamAlloc) {
+    Trace("XamAlloc",ctx);
+    uint32_t size = ctx.r4.u32;
+    ctx.r3.u64 = BumpAlloc(g_heap, size, 0x1000);
+}
+PPC_FUNC(__imp__XamFree) {
+    Trace("XamFree",ctx);
+    ctx.r3.u64 = 0;
+}
+
+PPC_FUNC(__imp__NetDll_XNetStartup)  { Trace("NetDll_XNetStartup",ctx);  ctx.r3.u64=0; }
+PPC_FUNC(__imp__NetDll_WSAStartup)   { Trace("NetDll_WSAStartup",ctx);   ctx.r3.u64=0; }
 
 // --- JNI ---
 
