@@ -95,10 +95,33 @@ echo "ATENÇÃO: isso não prova que o código compila nem que o jogo funciona."
 
 bash "$ROOT/tools/check_generated.sh" || true
 
-# Passos extras: qualquer tools/post_*.sh roda aqui, em ordem alfabetica
+# -----------------------------------------------------------------------------
+# Passos extras: qualquer tools/post_*.sh roda aqui, em ordem alfabetica.
+#
+# IMPORTANTE:
+#   - tools/post_instrument.sh e OBRIGATORIO. Se ele falhar, o build FALHA.
+#     Isso garante que o APK final SEMPRE tenha a instrumentacao de log
+#     (hooks em sub_824D1EE8, sub_825FC8F0, sub_82604428, sub_82603680)
+#     injetada nos .cpp gerados. Se o patch nao aplicar, e melhor descobrir
+#     agora do que gerar um APK sem diagnostico e perder tempo de teste.
+#   - Os demais tools/post_*.sh continuam opcionais (|| true).
+# -----------------------------------------------------------------------------
+
 for post in "$ROOT"/tools/post_*.sh; do
     if [[ -f "$post" ]]; then
         echo "==> Executando $(basename "$post")"
-        bash "$post" || true
+
+        if [[ "$(basename "$post")" == "post_instrument.sh" ]]; then
+            # Obrigatorio: falha = build falha
+            if ! bash "$post"; then
+                echo "::error::$(basename "$post") FALHOU — o APK sairia sem instrumentacao. Abortando o build."
+                exit 11
+            fi
+        else
+            # Opcional
+            bash "$post" || true
+        fi
     fi
 done
+
+echo "==> Pipeline do XenonRecomp concluido."
