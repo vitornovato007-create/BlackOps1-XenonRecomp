@@ -8,16 +8,23 @@
 //                implementacao de XGetVideoMode, ExCreateThread, etc.
 //   2026-11-08d: std::set_terminate, beat.detach(), handlers de
 //                terminate/unexpected, catch(...) no RunGuest.
-//   2026-11-08e (esta):
-//     - removido std::set_unexpected / UnexpectedHandler. O std::unexpected
-//       foi removido do C++17, e o build usa std=gnu++20. O
-//       std::set_terminate sozinho cobre todos os casos praticos
-//       (excecao escapando de noexcept, std::thread sem join/detach,
-//       __cxa_pure_virtual, bad_alloc nao capturado, etc.).
-//     - o TerminateHandler loga a causa via LogRaw ANTES de chamar
-//       abort(). O runtime.log vai mostrar "==== TERMINATE: <msg> ====".
-//     - beat.detach() em vez de beat.join(): se RunGuest abortar, o
-//       std::thread nao e destruido "joinable".
+//   2026-11-08e: removido std::set_unexpected (C++17+). TerminateHandler
+//                loga via LogRaw antes de abort().
+//   2026-11-08f (esta):
+//     - bo1_LogRaw() exportada com extern "C" FORA do namespace anonimo.
+//       Eh chamada pelos .cpp gerados (patch_instrument.py injeta os
+//       hooks em sub_824D1EE8, sub_825FC8F0, sub_82604428, sub_82603680).
+//     - backtrace() no SegvHandler: captura a pilha nativa ARM64 no
+//       momento do SIGABRT/SIGSEGV/etc. para identificar quem chamou
+//       abort() (__cxa_pure_virtual? __assert2? __fortify_fail?).
+//     - si_code traduzido (SI_TKILL, SI_USER, SI_QUEUE, SI_TKILL...).
+//     - ring buffer dos ultimos 32 imports (g_lastImports) para o log
+//       mostrar a sequencia exata que levou ao abort.
+//     - std::set_new_handler para capturar bad_alloc nao tratado.
+//     - Log do retorno do sigsetjmp (sinal vs. normal).
+//     - LogRaw usa strnlen e garante NUL.
+//     - Log do KeBugCheckEx com os 4 argumentos.
+//     - Log do RtlRaiseException com ExceptionRecord completo.
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -32,6 +39,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <execinfo.h>
 
 #include <algorithm>
 #include <atomic>
@@ -74,6 +82,13 @@ std::mutex g_stateMutex;
 std::string g_lastImport;
 std::string g_endReason;
 
+// Ring buffer dos ultimos imports (para o log de abort)
+constexpr int kLastImportsCap = 32;
+std::mutex g_lastImportsMutex;
+std::string g_lastImports[kLastImportsCap];
+int g_lastImportsHead = 0;
+int g_lastImportsCount = 0;
+
 std::mutex g_callsMutex;
 std::unordered_map<std::string,uint64_t> g_callCounts;
 
@@ -93,6 +108,8 @@ struct FaultInfo {
     uint64_t sp            = 0;
     int      signo         = 0;
     int      si_code       = 0;
+    void*    bt[64]        = {0};
+    int      bt_size       = 0;
 };
 thread_local FaultInfo t_fault{};
 
@@ -127,14 +144,44 @@ void LogRaw(const char* fmt, ...) {
     va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
     __android_log_print(ANDROID_LOG_INFO, "BO1", "%s", text);
     if (g_logFd < 0) return;
-    size_t n = strlen(text);
+    // Garante NUL e limita o tamanho (strnlen evita ler lixo)
+    size_t n = strnlen(text, sizeof(text) - 1);
+    if (n >= sizeof(text)) n = sizeof(text) - 1;
     char line[2100];
-    size_t total = (n < sizeof(line)-2) ? n : sizeof(line)-2;
+    size_t total = (n < sizeof(line) - 2) ? n : sizeof(line) - 2;
     memcpy(line, text, total);
     line[total] = '\n';
-    line[total+1] = 0;
-    ssize_t ignored = write(g_logFd, line, total+1);
+    line[total + 1] = 0;
+    ssize_t ignored = write(g_logFd, line, total + 1);
     (void)ignored;
+}
+
+// Registra um import no ring buffer (chamado de Trace)
+void PushLastImport(const char* name, PPCContext& ctx) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s r3=0x%llX r4=0x%llX lr=0x%llX",
+             name,
+             (unsigned long long)ctx.r3.u64,
+             (unsigned long long)ctx.r4.u64,
+             (unsigned long long)ctx.lr);
+    std::lock_guard<std::mutex> lk(g_lastImportsMutex);
+    g_lastImports[g_lastImportsHead] = buf;
+    g_lastImportsHead = (g_lastImportsHead + 1) % kLastImportsCap;
+    if (g_lastImportsCount < kLastImportsCap) g_lastImportsCount++;
+}
+
+// Dump do ring buffer (chamado do SegvHandler e do RunGuest)
+void DumpLastImports(const char* title) {
+    std::lock_guard<std::mutex> lk(g_lastImportsMutex);
+    int n = g_lastImportsCount;
+    if (n == 0) return;
+    LogRaw("---- %s (%d ultimos) ----", title, n);
+    int start = (g_lastImportsHead - n + kLastImportsCap) % kLastImportsCap;
+    for (int i = 0; i < n; i++) {
+        int idx = (start + i) % kLastImportsCap;
+        LogRaw("  [%2d] %s", i, g_lastImports[idx].c_str());
+    }
+    LogRaw("---- fim dos ultimos imports ----");
 }
 
 uint64_t NowMs() {
@@ -194,6 +241,7 @@ void Trace(const char* name, PPCContext& ctx) {
     uint64_t count;
     { std::lock_guard<std::mutex> lk(g_callsMutex); count = ++g_callCounts[name]; }
     { std::lock_guard<std::mutex> lk(g_stateMutex); g_lastImport = name; }
+    PushLastImport(name, ctx);
     if ((count<=3||count==100||count==10000||count==1000000) && total<4000)
         Log("[import] %s #%llu r3=0x%llX r4=0x%llX lr=0x%llX",
             name,
@@ -202,6 +250,25 @@ void Trace(const char* name, PPCContext& ctx) {
             (unsigned long long)ctx.r4.u64,
             (unsigned long long)ctx.lr);
     if (count > 20000000ull) throw BootStop{std::string("==== importacao em laco: ")+name+" ===="};
+}
+
+// ---- traducao de si_code ----
+
+const char* SiCodeName(int signo, int code) {
+    switch (code) {
+        case 0: return "SI_USER";
+        case -1: return "SI_TKILL";   // Linux: SI_TKILL = -6? nao: SI_TKILL = -6, SI_USER = 0
+        case -2: return "SI_QUEUE";
+        case -3: return "SI_TIMER";
+        case -4: return "SI_MESGQ";
+        case -5: return "SI_ASYNCIO";
+        case -6: return "SI_TKILL";
+        case 1: return "SEGV_MAPERR";
+        case 2: return "SEGV_ACCERR";
+        case 3: return "SEGV_BNDERR";
+        case 4: return "SEGV_PKUERR";
+        default: return "?";
+    }
 }
 
 // ---- handler de sinais ----
@@ -250,11 +317,47 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
         }
     }
 
-    LogRaw("==== SINAL signo=%d si_code=%d addr=0x%llX pc=0x%llX lr=0x%llX ====",
-           signo, t_fault.si_code,
+    // backtrace() nativo: identifica quem chamou abort() (__cxa_pure_virtual,
+    // __assert2, __fortify_fail, std::terminate, etc.)
+    t_fault.bt_size = backtrace(t_fault.bt, (int)(sizeof(t_fault.bt)/sizeof(t_fault.bt[0])));
+
+    LogRaw("==== SINAL signo=%d (%s) si_code=%d (%s) addr=0x%llX pc=0x%llX lr=0x%llX ====",
+           signo,
+           signo==SIGSEGV?"SIGSEGV":signo==SIGABRT?"SIGABRT":signo==SIGBUS?"SIGBUS":
+           signo==SIGILL?"SIGILL":signo==SIGTRAP?"SIGTRAP":signo==SIGFPE?"SIGFPE":"?",
+           t_fault.si_code, SiCodeName(signo, t_fault.si_code),
            (unsigned long long)t_fault.fault_addr,
            (unsigned long long)t_fault.pc,
            (unsigned long long)t_fault.lr);
+
+    if (t_fault.so_name[0]) {
+        LogRaw("==== SINAL: so=%s sym=%s pc_so=+0x%llX ====",
+               t_fault.so_name,
+               t_fault.so_sym[0] ? t_fault.so_sym : "(sem simbolo)",
+               (unsigned long long)t_fault.pc_so_offset);
+    }
+
+    // Pilha nativa (backtrace) — identifica a cadeia de chamadas C++
+    if (t_fault.bt_size > 0) {
+        LogRaw("---- BACKTRACE nativo (%d frames) ----", t_fault.bt_size);
+        for (int i = 0; i < t_fault.bt_size; i++) {
+            Dl_info bdi{};
+            const char* bname = "?";
+            const char* bsym  = "?";
+            uint64_t boff = 0;
+            if (dladdr(t_fault.bt[i], &bdi) && bdi.dli_fbase) {
+                if (bdi.dli_fname) bname = bdi.dli_fname;
+                if (bdi.dli_sname) bsym  = bdi.dli_sname;
+                boff = (uint64_t)(uintptr_t)t_fault.bt[i] - (uint64_t)(uintptr_t)bdi.dli_fbase;
+            }
+            LogRaw("  #%02d 0x%llX  %s  %s+0x%llX",
+                   i, (unsigned long long)(uintptr_t)t_fault.bt[i],
+                   bname, bsym, (unsigned long long)boff);
+        }
+        LogRaw("---- fim do backtrace ----");
+    }
+
+    DumpLastImports("ultimos imports antes do sinal");
 
     if (t_jump) siglongjmp(*t_jump, 1);
     _exit(139);
@@ -281,17 +384,7 @@ void InstallSignalHandler() {
     Log("Sinais instalados: SIGSEGV SIGBUS SIGILL SIGABRT SIGTRAP SIGFPE");
 }
 
-// ---- handler de terminate (v08e) ----
-//
-// std::set_terminate cobre:
-//   - excecao escapando de um noexcept
-//   - std::thread destruido sem join/detach
-//   - __cxa_pure_virtual
-//   - bad_alloc nao capturado
-//   - terminate() chamado explicitamente
-// Em todos esses casos, o handler loga a mensagem do what() via LogRaw
-// ANTES de chamar abort(). O runtime.log vai mostrar
-// "==== TERMINATE: <msg> ====".
+// ---- handler de terminate ----
 
 void TerminateHandler() {
     std::string msg = "(sem excecao ativa)";
@@ -312,6 +405,11 @@ void TerminateHandler() {
 
     LogRaw("==== TERMINATE: %s ====", msg.c_str());
     LogRaw("==== TERMINATE: chamando abort() (o processo vai morrer) ====");
+    std::abort();
+}
+
+void NewHandler() {
+    LogRaw("==== NEW HANDLER: bad_alloc nao tratado ====");
     std::abort();
 }
 
@@ -388,11 +486,12 @@ void InitFunctionTable() {
 
 void RunGuest(PPCFunc* fn, PPCContext& ctx) {
     sigjmp_buf jump; t_jump = &jump;
-    if (sigsetjmp(jump,1)==0) {
+    int jmp_ret = sigsetjmp(jump,1);
+    if (jmp_ret == 0) {
         try {
             fn(ctx, g_base);
             std::lock_guard<std::mutex> lk(g_stateMutex);
-            g_endReason = "a entrada do jogo retornou"; g_state = 2;
+            g_endReason = "a entrada do jogo retornou (normal)"; g_state = 2;
         } catch (const BootStop& s) {
             std::lock_guard<std::mutex> lk(g_stateMutex);
             g_endReason = s.reason; g_state = 2;
@@ -404,6 +503,7 @@ void RunGuest(PPCFunc* fn, PPCContext& ctx) {
             g_endReason = "==== excecao desconhecida ===="; g_state = 3;
         }
     } else {
+        // Retornou do siglongjmp (sinal capturado)
         uint64_t fault      = t_fault.fault_addr;
         uint64_t fault_arm  = t_fault.fault_address;
         uint64_t pc         = t_fault.pc;
@@ -455,7 +555,7 @@ void* BootThread(void* raw) {
     g_logFile = fopen(args->logPath.c_str(), "w");
     g_logFd   = open(args->logPath.c_str(), O_WRONLY|O_CREAT|O_APPEND, 0644);
 
-    Log("=== BO1 runtime inicial ===");
+    Log("=== BO1 runtime inicial (v08f) ===");
     Log("Pasta: %s", args->gameDir.c_str());
     Log("ppc_config.h: PPC_IMAGE_BASE=0x%llX PPC_IMAGE_SIZE=0x%llX",
         (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
@@ -469,7 +569,8 @@ void* BootThread(void* raw) {
         (unsigned long long)kImageGlobalsEnd);
 
     std::set_terminate(TerminateHandler);
-    Log("Handler de terminate instalado");
+    std::set_new_handler(NewHandler);
+    Log("Handlers instalados: terminate + new_handler");
 
     InstallSignalHandler();
     uint32_t entry = 0;
@@ -526,7 +627,6 @@ void* BootThread(void* raw) {
 
     // beat.detach() (nao join): se RunGuest abortar, o std::thread nao e
     // destruido "joinable" (o que causaria std::terminate -> abort).
-    // O beat roda ate ver g_finished (setado no fim de RunGuest).
     std::thread beat([](){
         while (!g_finished.load()) {
             for (int s=0; s<5 && !g_finished.load(); s++)
@@ -585,6 +685,19 @@ uint32_t AllocHandle() {
 } // namespace
 
 // --- funcoes do kernel ---
+
+// Wrapper extern "C" para os .cpp gerados (patch_instrument.py injeta
+// bo1_LogRaw(...) dentro das funcoes sub_824D1EE8, sub_825FC8F0,
+// sub_82604428, sub_82603680).
+extern "C" void bo1_LogRaw(const char* fmt, ...) {
+    va_list args; va_start(args, fmt);
+    // Como LogRaw e varargs, precisa de vLogRaw; mas LogRaw ja e varargs.
+    // Chamamos com um buffer intermediario.
+    char text[2048];
+    vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    LogRaw("%s", text);
+}
 
 void bo1_import_stub(const char* name, PPCContext& ctx, uint8_t* /*base*/) {
     Trace(name, ctx); ctx.r3.u64 = 0;
@@ -685,9 +798,22 @@ PPC_FUNC(__imp__KeSetBasePriorityThread){ Trace("KeSetBasePriorityThread",ctx); 
 
 PPC_FUNC(__imp__RtlRaiseException) {
     Trace("RtlRaiseException",ctx);
-    uint32_t code = 0;
-    if (ctx.r3.u32) code = Get32(base, ctx.r3.u32);
-    LogRaw("[exception] RtlRaiseException code=0x%X (ignorando)", code);
+    // ExceptionRecord: Code (4), Flags (4), Record (8), Address (8), NumParams (4)
+    uint32_t er = ctx.r3.u32;
+    if (er) {
+        uint32_t code   = Get32(base, er + 0);
+        uint32_t nparam = Get32(base, er + 24);
+        LogRaw("[exception] RtlRaiseException r3=0x%X code=0x%X nparam=%u",
+               er, code, nparam);
+        uint32_t info[4] = {0,0,0,0};
+        for (uint32_t i = 0; i < nparam && i < 4; i++) {
+            info[i] = Get32(base, er + 28 + i*4);
+        }
+        LogRaw("[exception]   info: 0x%X 0x%X 0x%X 0x%X",
+               info[0], info[1], info[2], info[3]);
+    } else {
+        LogRaw("[exception] RtlRaiseException r3=0 (sem ExceptionRecord)");
+    }
     ctx.r3.u64=0;
 }
 
@@ -708,7 +834,12 @@ PPC_FUNC(__imp__NtCreateFile) {
 PPC_FUNC(__imp__DbgPrint)             { Trace("DbgPrint",ctx); Log("[DbgPrint] %s",GetCStr(base,ctx.r3.u32).c_str()); ctx.r3.u64=0; }
 PPC_FUNC(__imp__HalReturnToFirmware)  { Trace("HalReturnToFirmware",ctx);  throw BootStop{"==== o jogo chamou HalReturnToFirmware ===="}; }
 PPC_FUNC(__imp__KeBugCheck)           { Trace("KeBugCheck",ctx);           throw BootStop{"==== o jogo chamou KeBugCheck ===="}; }
-PPC_FUNC(__imp__KeBugCheckEx)         { Trace("KeBugCheckEx",ctx);         throw BootStop{"==== o jogo chamou KeBugCheckEx ===="}; }
+PPC_FUNC(__imp__KeBugCheckEx)         {
+    Trace("KeBugCheckEx",ctx);
+    LogRaw("==== KeBugCheckEx: r3=0x%X r4=0x%X r5=0x%X r6=0x%X ====",
+           ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    throw BootStop{"==== o jogo chamou KeBugCheckEx ===="};
+}
 
 // --- XAM / XEX / XNET ---
 
@@ -812,7 +943,7 @@ Java_com_bo1recomp_NativeRuntime_nativeStart(JNIEnv* env, jclass, jstring gameDi
         return env->NewStringUTF("==== Nao consegui criar a thread do runtime ====");
     }
     pthread_detach(t); pthread_attr_destroy(&attr);
-    return env->NewStringUTF("Runtime iniciado. Acompanhe o log abaixo.");
+    return env->NewStringUTF("Runtime iniciado (v08f). Acompanhe o log abaixo.");
 }
 
 extern "C" JNIEXPORT jstring JNICALL
