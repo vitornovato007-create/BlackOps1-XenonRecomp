@@ -17,6 +17,8 @@
 //     - backtrace() no SegvHandler: captura a pilha nativa ARM64 no
 //       momento do SIGABRT/SIGSEGV/etc. para identificar quem chamou
 //       abort() (__cxa_pure_virtual? __assert2? __fortify_fail?).
+//       ATENCAO: o NDK 27 nao declara backtrace() em <execinfo.h>,
+//       entao declaramos manualmente como extern "C".
 //     - si_code traduzido (SI_TKILL, SI_USER, SI_QUEUE, SI_TKILL...).
 //     - ring buffer dos ultimos 32 imports (g_lastImports) para o log
 //       mostrar a sequencia exata que levou ao abort.
@@ -39,7 +41,10 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <execinfo.h>
+
+// backtrace() no bionic (Android) nao esta declarado em <execinfo.h> no NDK 27.
+// Declaramos manualmente como extern "C" — o simbolo existe no libc desde API 21.
+extern "C" int backtrace(void** buffer, int size);
 
 #include <algorithm>
 #include <atomic>
@@ -144,7 +149,6 @@ void LogRaw(const char* fmt, ...) {
     va_list args; va_start(args, fmt); vsnprintf(text, sizeof(text), fmt, args); va_end(args);
     __android_log_print(ANDROID_LOG_INFO, "BO1", "%s", text);
     if (g_logFd < 0) return;
-    // Garante NUL e limita o tamanho (strnlen evita ler lixo)
     size_t n = strnlen(text, sizeof(text) - 1);
     if (n >= sizeof(text)) n = sizeof(text) - 1;
     char line[2100];
@@ -170,7 +174,7 @@ void PushLastImport(const char* name, PPCContext& ctx) {
     if (g_lastImportsCount < kLastImportsCap) g_lastImportsCount++;
 }
 
-// Dump do ring buffer (chamado do SegvHandler e do RunGuest)
+// Dump do ring buffer (chamado do SegvHandler)
 void DumpLastImports(const char* title) {
     std::lock_guard<std::mutex> lk(g_lastImportsMutex);
     int n = g_lastImportsCount;
@@ -257,7 +261,7 @@ void Trace(const char* name, PPCContext& ctx) {
 const char* SiCodeName(int signo, int code) {
     switch (code) {
         case 0: return "SI_USER";
-        case -1: return "SI_TKILL";   // Linux: SI_TKILL = -6? nao: SI_TKILL = -6, SI_USER = 0
+        case -1: return "SI_TKILL";
         case -2: return "SI_QUEUE";
         case -3: return "SI_TIMER";
         case -4: return "SI_MESGQ";
@@ -317,8 +321,7 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
         }
     }
 
-    // backtrace() nativo: identifica quem chamou abort() (__cxa_pure_virtual,
-    // __assert2, __fortify_fail, std::terminate, etc.)
+    // backtrace() nativo: identifica quem chamou abort()
     t_fault.bt_size = backtrace(t_fault.bt, (int)(sizeof(t_fault.bt)/sizeof(t_fault.bt[0])));
 
     LogRaw("==== SINAL signo=%d (%s) si_code=%d (%s) addr=0x%llX pc=0x%llX lr=0x%llX ====",
@@ -337,7 +340,7 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
                (unsigned long long)t_fault.pc_so_offset);
     }
 
-    // Pilha nativa (backtrace) — identifica a cadeia de chamadas C++
+    // Pilha nativa (backtrace)
     if (t_fault.bt_size > 0) {
         LogRaw("---- BACKTRACE nativo (%d frames) ----", t_fault.bt_size);
         for (int i = 0; i < t_fault.bt_size; i++) {
@@ -625,8 +628,6 @@ void* BootThread(void* raw) {
     g_state = 1;
     g_lastCallMs.store(NowMs(), std::memory_order_relaxed);
 
-    // beat.detach() (nao join): se RunGuest abortar, o std::thread nao e
-    // destruido "joinable" (o que causaria std::terminate -> abort).
     std::thread beat([](){
         while (!g_finished.load()) {
             for (int s=0; s<5 && !g_finished.load(); s++)
@@ -690,10 +691,8 @@ uint32_t AllocHandle() {
 // bo1_LogRaw(...) dentro das funcoes sub_824D1EE8, sub_825FC8F0,
 // sub_82604428, sub_82603680).
 extern "C" void bo1_LogRaw(const char* fmt, ...) {
-    va_list args; va_start(args, fmt);
-    // Como LogRaw e varargs, precisa de vLogRaw; mas LogRaw ja e varargs.
-    // Chamamos com um buffer intermediario.
     char text[2048];
+    va_list args; va_start(args, fmt);
     vsnprintf(text, sizeof(text), fmt, args);
     va_end(args);
     LogRaw("%s", text);
@@ -798,7 +797,6 @@ PPC_FUNC(__imp__KeSetBasePriorityThread){ Trace("KeSetBasePriorityThread",ctx); 
 
 PPC_FUNC(__imp__RtlRaiseException) {
     Trace("RtlRaiseException",ctx);
-    // ExceptionRecord: Code (4), Flags (4), Record (8), Address (8), NumParams (4)
     uint32_t er = ctx.r3.u32;
     if (er) {
         uint32_t code   = Get32(base, er + 0);
