@@ -10,23 +10,15 @@
 //                terminate/unexpected, catch(...) no RunGuest.
 //   2026-11-08e: removido std::set_unexpected (C++17+). TerminateHandler
 //                loga via LogRaw antes de abort().
-//   2026-11-08f (esta):
-//     - bo1_LogRaw() exportada com extern "C" FORA do namespace anonimo.
-//       Eh chamada pelos .cpp gerados (patch_instrument.py injeta os
-//       hooks em sub_824D1EE8, sub_825FC8F0, sub_82604428, sub_82603680).
-//     - backtrace() no SegvHandler: captura a pilha nativa ARM64 no
-//       momento do SIGABRT/SIGSEGV/etc. para identificar quem chamou
-//       abort() (__cxa_pure_virtual? __assert2? __fortify_fail?).
-//       ATENCAO: o NDK 27 nao declara backtrace() em <execinfo.h>,
-//       entao declaramos manualmente como extern "C".
-//     - si_code traduzido (SI_TKILL, SI_USER, SI_QUEUE, SI_TKILL...).
-//     - ring buffer dos ultimos 32 imports (g_lastImports) para o log
-//       mostrar a sequencia exata que levou ao abort.
-//     - std::set_new_handler para capturar bad_alloc nao tratado.
-//     - Log do retorno do sigsetjmp (sinal vs. normal).
-//     - LogRaw usa strnlen e garante NUL.
-//     - Log do KeBugCheckEx com os 4 argumentos.
-//     - Log do RtlRaiseException com ExceptionRecord completo.
+//   2026-11-08f: bo1_LogRaw() exportada com extern "C" FORA do namespace
+//                anonimo (chamada pelos .cpp gerados via patch_instrument.py),
+//                si_code traduzido, ring buffer de imports, set_new_handler,
+//                Log do KeBugCheckEx / RtlRaiseException.
+//   2026-11-08g (esta):
+//     - backtrace() do sistema NAO linka em API 29 (so existe a partir
+//       da API 33). Substituido por _Unwind_Backtrace (ABI do compilador,
+//       sempre disponivel no NDK). A pilha nativa continua sendo resolvida
+//       via dladdr (que ja existia).
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -41,10 +33,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <fcntl.h>
-
-// backtrace() no bionic (Android) nao esta declarado em <execinfo.h> no NDK 27.
-// Declaramos manualmente como extern "C" — o simbolo existe no libc desde API 21.
-extern "C" int backtrace(void** buffer, int size);
+#include <unwind.h>
 
 #include <algorithm>
 #include <atomic>
@@ -193,6 +182,35 @@ uint64_t NowMs() {
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 }
 
+// ---- backtrace via _Unwind_Backtrace (ABI do compilador) ----
+//
+// O backtrace() do libc so existe a partir da API 33; em API 29 o linker
+// nao encontra o simbolo. _Unwind_Backtrace e parte da ABI do compilador
+// (libgcc/libunwind) e esta sempre disponivel no NDK.
+
+struct BacktraceState {
+    void** current;
+    void** end;
+};
+
+static _Unwind_Reason_Code UnwindCallback(struct _Unwind_Context* context, void* arg) {
+    BacktraceState* state = static_cast<BacktraceState*>(arg);
+    uintptr_t pc = _Unwind_GetIP(context);
+    if (pc) {
+        if (state->current == state->end) {
+            return _URC_END_OF_STACK;
+        }
+        *state->current++ = reinterpret_cast<void*>(pc);
+    }
+    return _URC_NO_REASON;
+}
+
+static int CaptureBacktrace(void** buffer, int max) {
+    BacktraceState state = { buffer, buffer + max };
+    _Unwind_Backtrace(UnwindCallback, &state);
+    return static_cast<int>(state.current - buffer);
+}
+
 // ---- helpers ----
 
 uint32_t Get32(const uint8_t* b, uint32_t a) { uint32_t v; memcpy(&v,b+a,4); return __builtin_bswap32(v); }
@@ -321,8 +339,8 @@ void SegvHandler(int signo, siginfo_t* info, void* ucv) {
         }
     }
 
-    // backtrace() nativo: identifica quem chamou abort()
-    t_fault.bt_size = backtrace(t_fault.bt, (int)(sizeof(t_fault.bt)/sizeof(t_fault.bt[0])));
+    // Pilha nativa via _Unwind_Backtrace (identifica quem chamou abort())
+    t_fault.bt_size = CaptureBacktrace(t_fault.bt, (int)(sizeof(t_fault.bt)/sizeof(t_fault.bt[0])));
 
     LogRaw("==== SINAL signo=%d (%s) si_code=%d (%s) addr=0x%llX pc=0x%llX lr=0x%llX ====",
            signo,
@@ -558,7 +576,7 @@ void* BootThread(void* raw) {
     g_logFile = fopen(args->logPath.c_str(), "w");
     g_logFd   = open(args->logPath.c_str(), O_WRONLY|O_CREAT|O_APPEND, 0644);
 
-    Log("=== BO1 runtime inicial (v08f) ===");
+    Log("=== BO1 runtime inicial (v08g) ===");
     Log("Pasta: %s", args->gameDir.c_str());
     Log("ppc_config.h: PPC_IMAGE_BASE=0x%llX PPC_IMAGE_SIZE=0x%llX",
         (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
@@ -941,7 +959,7 @@ Java_com_bo1recomp_NativeRuntime_nativeStart(JNIEnv* env, jclass, jstring gameDi
         return env->NewStringUTF("==== Nao consegui criar a thread do runtime ====");
     }
     pthread_detach(t); pthread_attr_destroy(&attr);
-    return env->NewStringUTF("Runtime iniciado (v08f). Acompanhe o log abaixo.");
+    return env->NewStringUTF("Runtime iniciado (v08g). Acompanhe o log abaixo.");
 }
 
 extern "C" JNIEXPORT jstring JNICALL
