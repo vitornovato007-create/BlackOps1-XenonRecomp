@@ -14,11 +14,22 @@
 //                anonimo (chamada pelos .cpp gerados via patch_instrument.py),
 //                si_code traduzido, ring buffer de imports, set_new_handler,
 //                Log do KeBugCheckEx / RtlRaiseException.
-//   2026-11-08g (esta):
-//     - backtrace() do sistema NAO linka em API 29 (so existe a partir
-//       da API 33). Substituido por _Unwind_Backtrace (ABI do compilador,
-//       sempre disponivel no NDK). A pilha nativa continua sendo resolvida
-//       via dladdr (que ja existia).
+//   2026-11-08g: backtrace() do sistema NAO linka em API 29 (so existe a
+//                partir da API 33). Substituido por _Unwind_Backtrace.
+//   2026-11-08h (esta):
+//     - Adicionado stub blr (0x4E800020) em g_blr_stub_addr.
+//     - __imp__XexGetProcedureAddress agora retorna g_blr_stub_addr em
+//       *r5 (em vez de 0) e o status 0xC0000263 continua sendo retornado.
+//       ATENCAO: isso e um experimento sugerido pelo Claude. A analise
+//       anterior (Parte 13 do prompt de continuidade) REFUTOU a hipotese
+//       do stub blr, porque sub_824CEA10 verifica se os ponteiros sao 0
+//       e faz cleanup. Com o stub blr, o jogo vai usar os ponteiros como
+//       se fossem funcoes reais, mas o blr nao faz nada — o jogo pode
+//       seguir com estado invalido e crashar em outro lugar.
+//     - Adicionado log de confirmacao no bo1_LogRaw: as primeiras 20
+//       chamadas aparecem como "[bo1_LogRaw] chamada #N". Se nao aparecer
+//       nenhuma, os hooks NAO estao sendo chamados (problema no patch ou
+//       no link).
 
 #ifdef BO1_HAVE_GENERATED
 
@@ -122,6 +133,10 @@ struct Bump { uint32_t current; uint32_t end; };
 std::mutex g_memMutex;
 Bump g_heap{kHeapStart, kHeapEnd};
 Bump g_phys{kPhysStart, kPhysEnd};
+
+// Stub blr: usado por __imp__XexGetProcedureAddress quando o ordinal
+// nao existe. 0x4E800020 = "blr" (branch to link register).
+uint32_t g_blr_stub_addr = 0;
 
 // ---- logging ----
 
@@ -576,7 +591,7 @@ void* BootThread(void* raw) {
     g_logFile = fopen(args->logPath.c_str(), "w");
     g_logFd   = open(args->logPath.c_str(), O_WRONLY|O_CREAT|O_APPEND, 0644);
 
-    Log("=== BO1 runtime inicial (v08g) ===");
+    Log("=== BO1 runtime inicial (v08h) ===");
     Log("Pasta: %s", args->gameDir.c_str());
     Log("ppc_config.h: PPC_IMAGE_BASE=0x%llX PPC_IMAGE_SIZE=0x%llX",
         (unsigned long long)PPC_IMAGE_BASE, (unsigned long long)PPC_IMAGE_SIZE);
@@ -603,6 +618,18 @@ void* BootThread(void* raw) {
         g_finished.store(true);
         return nullptr;
     }
+
+    // Stub blr: aloca 1 pagina no heap, escreve "blr" (0x4E800020) no inicio.
+    // Usado por __imp__XexGetProcedureAddress quando o ordinal nao existe.
+    g_blr_stub_addr = BumpAlloc(g_heap, 0x1000, 0x1000);
+    if (g_blr_stub_addr) {
+        uint32_t blr = __builtin_bswap32(0x4E800020u);
+        memcpy(g_base + g_blr_stub_addr, &blr, 4);
+        Log("blr stub em 0x%X", g_blr_stub_addr);
+    } else {
+        Log("==== ERRO: nao consegui alocar blr stub ====");
+    }
+
     InitFunctionTable();
     PPCFunc* fn = PPC_LOOKUP_FUNC(g_base, entry);
     if (!fn) {
@@ -708,7 +735,16 @@ uint32_t AllocHandle() {
 // Wrapper extern "C" para os .cpp gerados (patch_instrument.py injeta
 // bo1_LogRaw(...) dentro das funcoes sub_824D1EE8, sub_825FC8F0,
 // sub_82604428, sub_82603680).
+//
+// Log de confirmacao: as primeiras 20 chamadas aparecem como
+// "[bo1_LogRaw] chamada #N". Se nao aparecer nenhuma, os hooks NAO
+// estao sendo chamados.
 extern "C" void bo1_LogRaw(const char* fmt, ...) {
+    static std::atomic<int> call_count{0};
+    int n = ++call_count;
+    if (n <= 20) {
+        LogRaw("[bo1_LogRaw] chamada #%d", n);
+    }
     char text[2048];
     va_list args; va_start(args, fmt);
     vsnprintf(text, sizeof(text), fmt, args);
@@ -869,8 +905,13 @@ PPC_FUNC(__imp__XexLoadImage) {
 }
 PPC_FUNC(__imp__XexGetProcedureAddress) {
     Trace("XexGetProcedureAddress",ctx);
-    if (ctx.r5.u32) Put32(base, ctx.r5.u32, 0);
-    ctx.r3.u64 = 0xC0000263u;
+    // Stub blr: em vez de escrever 0 em *r5, escreve o endereco do stub
+    // (que e um "blr" e simplesmente retorna). O status de erro
+    // 0xC0000263 continua sendo retornado em r3.
+    if (ctx.r5.u32 != 0) {
+        Put32(base, ctx.r5.u32, g_blr_stub_addr);
+    }
+    ctx.r3.u64 = 0xC0000263u; // STATUS_PROCEDURE_NOT_FOUND
 }
 PPC_FUNC(__imp__XexUnloadImage) {
     Trace("XexUnloadImage",ctx);
@@ -959,7 +1000,7 @@ Java_com_bo1recomp_NativeRuntime_nativeStart(JNIEnv* env, jclass, jstring gameDi
         return env->NewStringUTF("==== Nao consegui criar a thread do runtime ====");
     }
     pthread_detach(t); pthread_attr_destroy(&attr);
-    return env->NewStringUTF("Runtime iniciado (v08g). Acompanhe o log abaixo.");
+    return env->NewStringUTF("Runtime iniciado (v08h). Acompanhe o log abaixo.");
 }
 
 extern "C" JNIEXPORT jstring JNICALL
